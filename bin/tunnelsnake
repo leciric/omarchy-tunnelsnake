@@ -1,0 +1,416 @@
+#!/usr/bin/env bash
+# tunnelsnake — openvpn3 bridge for the Tunnelsnake Omarchy bar widget.
+#
+# Every subcommand prints one JSON object on stdout so the QML side can
+# JSON.parse() it directly. Failures are reported inside the payload (the
+# "error" field) rather than on stderr, so a failed call still renders in the
+# panel instead of vanishing.
+#
+# Commands:
+#   status                      Sessions, link details, and transfer counters
+#   profiles [DIR ...]          .ovpn files in DIRs plus openvpn3-imported configs
+#   connect PROFILE [opts]      Start a session, wait for the tun device, wire DNS
+#   disconnect [SESSION_PATH]   Disconnect one session, or all of them
+#   dns DEVICE [opts]           Re-apply DNS to a device that is already up
+#
+# Options for connect/dns:
+#   --dns-server ADDR     DNS server to pin on the tunnel device
+#   --dns-domain DOMAIN   Routing domain, repeatable (~example.com routes only that domain)
+#   --timeout SECS        How long to wait for the tun device (default 30)
+#
+# The DNS calls go through resolvectl as your own user: systemd-resolved asks
+# polkit, Omarchy's polkit agent prompts once, and the answer is cached. Only if
+# that path fails do we retry under pkexec.
+
+set -uo pipefail
+
+OVPN3=${TUNNELSNAKE_OPENVPN3:-openvpn3}
+RESOLVECTL=${TUNNELSNAKE_RESOLVECTL:-resolvectl}
+IP_BIN=${TUNNELSNAKE_IP:-ip}
+
+# ------------------------------------------------------------------ JSON bits
+
+json_str() {
+  local s=${1-}
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\r'/}
+  s=${s//$'\t'/ }
+  s=${s//$'\n'/ }
+  printf '"%s"' "$s"
+}
+
+json_words() {
+  # Space-separated words -> JSON array of strings.
+  local out="" word
+  for word in ${1-}; do
+    [[ -n $out ]] && out+=","
+    out+=$(json_str "$word")
+  done
+  printf '[%s]' "$out"
+}
+
+trim() {
+  local s=${1-}
+  s=${s#"${s%%[![:space:]]*}"}
+  s=${s%"${s##*[![:space:]]}"}
+  printf '%s' "$s"
+}
+
+expand_home() {
+  local p=${1-}
+  [[ $p == "~" ]] && p=$HOME
+  [[ $p == "~/"* ]] && p="$HOME/${p#\~/}"
+  printf '%s' "$p"
+}
+
+have_openvpn3() { command -v "$OVPN3" >/dev/null 2>&1; }
+
+# ------------------------------------------------------------------- sessions
+
+SESSIONS_JSON="[]"
+SESSION_COUNT=0
+SESSION_PATHS=()
+ACTIVE_PATH=""
+ACTIVE_DEVICE=""
+ACTIVE_STATE="disconnected"
+
+# openvpn3 reports "Connection, Client connected" and friends; collapse the
+# variants into the four states the widget actually draws.
+state_from_status() {
+  local s=${1-}
+  s=${s,,}
+  case $s in
+    *"client connected"*|*"connection, connected"*) printf 'connected' ;;
+    *paused*)                                      printf 'paused' ;;
+    *connecting*|*resolv*|*wait*|*auth*|*reconnect*|*"client restart"*) printf 'connecting' ;;
+    *disconnect*)                                  printf 'disconnected' ;;
+    *)                                             printf 'unknown' ;;
+  esac
+}
+
+collect_sessions() {
+  local raw line trimmed
+  local path="" created="" owner="" device="" config="" name="" status=""
+  local items="" count=0
+
+  SESSIONS_JSON="[]"
+  SESSION_COUNT=0
+  SESSION_PATHS=()
+  ACTIVE_PATH=""
+  ACTIVE_DEVICE=""
+  ACTIVE_STATE="disconnected"
+
+  # Bash is dynamically scoped, so this helper reads and resets the record
+  # variables declared above.
+  _flush_session() {
+    [[ -z $path ]] && return 0
+    local state
+    state=$(state_from_status "$status")
+    [[ -n $items ]] && items+=","
+    items+="{\"path\":$(json_str "$path")"
+    items+=",\"created\":$(json_str "$created")"
+    items+=",\"owner\":$(json_str "$owner")"
+    items+=",\"device\":$(json_str "$device")"
+    items+=",\"config\":$(json_str "$config")"
+    items+=",\"name\":$(json_str "$name")"
+    items+=",\"status\":$(json_str "$status")"
+    items+=",\"state\":$(json_str "$state")}"
+    SESSION_PATHS+=("$path")
+    count=$((count + 1))
+    # The connected session wins the "active" slot; otherwise the first one
+    # keeps it, so a stalled connection still shows its device and status.
+    if [[ -z $ACTIVE_PATH || ( $state == connected && $ACTIVE_STATE != connected ) ]]; then
+      ACTIVE_PATH=$path
+      ACTIVE_DEVICE=$device
+      ACTIVE_STATE=$state
+    fi
+    path=""; created=""; owner=""; device=""; config=""; name=""; status=""
+  }
+
+  raw=$("$OVPN3" sessions-list 2>&1)
+  while IFS= read -r line; do
+    trimmed=$(trim "$line")
+    case $trimmed in
+      Path:*)
+        _flush_session
+        path=$(trim "${trimmed#Path:}")
+        ;;
+      Created:*)
+        created=$(trim "${trimmed#Created:}")
+        created=$(trim "${created%%PID:*}")
+        ;;
+      Owner:*)
+        owner=$(trim "${trimmed#Owner:}")
+        owner=$(trim "${owner%%Device:*}")
+        ;;
+      "Config name:"*)
+        config=$(trim "${trimmed#Config name:}")
+        config=$(trim "${config%%'(Config path:'*}")
+        ;;
+      "Session name:"*)
+        name=$(trim "${trimmed#Session name:}")
+        ;;
+      Status:*)
+        status=$(trim "${trimmed#Status:}")
+        ;;
+    esac
+    # Device rides along at the end of the Owner line.
+    if [[ $trimmed == *Device:* ]]; then
+      device=$(trim "${trimmed#*Device:}")
+      device=${device%% *}
+      [[ $device == "(not" || $device == "N/A" ]] && device=""
+    fi
+  done <<<"$raw"
+  _flush_session
+
+  SESSIONS_JSON="[$items]"
+  SESSION_COUNT=$count
+}
+
+link_json() {
+  local dev=${1-}
+  if [[ -z $dev ]]; then
+    printf '{"device":null,"ipv4":null,"dns":[],"domains":[]}'
+    return 0
+  fi
+  local ipv4 dns domains
+  ipv4=$("$IP_BIN" -4 -o addr show "$dev" 2>/dev/null | awk '{print $4; exit}')
+  # resolvectl prints "Link 12 (tun0): 1.2.3.4"; keep only what follows.
+  dns=$("$RESOLVECTL" dns "$dev" 2>/dev/null | sed 's/^.*): *//' | tr '\n' ' ')
+  domains=$("$RESOLVECTL" domain "$dev" 2>/dev/null | sed 's/^.*): *//' | tr '\n' ' ')
+  printf '{"device":%s,"ipv4":%s,"dns":%s,"domains":%s}' \
+    "$(json_str "$dev")" \
+    "$([[ -n $ipv4 ]] && json_str "$ipv4" || printf 'null')" \
+    "$(json_words "$dns")" \
+    "$(json_words "$domains")"
+}
+
+stats_json() {
+  local path=${1-} raw
+  [[ -z $path ]] && { printf 'null'; return 0; }
+  raw=$("$OVPN3" session-stats --path "$path" --json 2>/dev/null | tr -d '\n')
+  [[ ${raw:0:1} == "{" ]] || { printf 'null'; return 0; }
+  printf '%s' "$raw"
+}
+
+# ------------------------------------------------------------------- commands
+
+cmd_status() {
+  if ! have_openvpn3; then
+    printf '{"installed":false,"state":"missing","activePath":"","sessionCount":0,"sessions":[],"link":null,"stats":null,"error":"openvpn3 is not installed"}\n'
+    return 0
+  fi
+  collect_sessions
+  printf '{"installed":true,"state":%s,"activePath":%s,"sessionCount":%d,"sessions":%s,"link":%s,"stats":%s,"error":null}\n' \
+    "$(json_str "$ACTIVE_STATE")" "$(json_str "$ACTIVE_PATH")" "$SESSION_COUNT" \
+    "$SESSIONS_JSON" "$(link_json "$ACTIVE_DEVICE")" "$(stats_json "$ACTIVE_PATH")"
+}
+
+# Imported profiles live in the openvpn3 config manager; loose ones are just
+# .ovpn files on disk. The widget treats both as something you can connect to.
+imported_profiles() {
+  local raw line trimmed items="" path="" name=""
+  have_openvpn3 || { printf '%s' "$items"; return 0; }
+  raw=$("$OVPN3" configs-list 2>/dev/null)
+
+  _flush_config() {
+    [[ -z $path || -z $name ]] && { path=""; name=""; return 0; }
+    [[ -n $items ]] && items+=","
+    items+="{\"kind\":\"imported\",\"id\":$(json_str "$path"),\"name\":$(json_str "$name"),\"path\":$(json_str "$path")}"
+    path=""; name=""
+  }
+
+  while IFS= read -r line; do
+    trimmed=$(trim "$line")
+    case $trimmed in
+      /net/openvpn/v3/configuration/*)
+        _flush_config
+        path=$trimmed
+        ;;
+      ---*|"") ;;
+      *)
+        # Inside a record the name is the line that is not the timestamp row.
+        [[ -n $path && $trimmed != *":"*":"* ]] && name=$trimmed
+        ;;
+    esac
+  done <<<"$raw"
+  _flush_config
+  printf '%s' "$items"
+}
+
+cmd_profiles() {
+  local items dir file name
+  items=$(imported_profiles)
+  for dir in "$@"; do
+    dir=$(expand_home "$dir")
+    [[ -d $dir ]] || continue
+    while IFS= read -r file; do
+      [[ -n $file ]] || continue
+      name=${file##*/}
+      [[ -n $items ]] && items+=","
+      items+="{\"kind\":\"file\",\"id\":$(json_str "$file"),\"name\":$(json_str "${name%.ovpn}"),\"path\":$(json_str "$file")}"
+    done < <(find "$dir" -maxdepth 2 -type f -name '*.ovpn' 2>/dev/null | sort)
+  done
+  printf '{"profiles":[%s],"error":null}\n' "$items"
+}
+
+apply_dns() {
+  local dev=$1 server=$2
+  shift 2
+  local -a domains=("$@")
+  local err="" resolvectl_bin
+  resolvectl_bin=$(command -v "$RESOLVECTL" 2>/dev/null || printf '%s' "$RESOLVECTL")
+
+  if [[ -n $server ]]; then
+    if ! err=$("$RESOLVECTL" dns "$dev" "$server" 2>&1); then
+      if ! err=$(pkexec "$resolvectl_bin" dns "$dev" "$server" 2>&1); then
+        printf 'DNS server not applied: %s' "$(trim "$err")"
+        return 1
+      fi
+    fi
+  fi
+  if ((${#domains[@]} > 0)); then
+    if ! err=$("$RESOLVECTL" domain "$dev" "${domains[@]}" 2>&1); then
+      if ! err=$(pkexec "$resolvectl_bin" domain "$dev" "${domains[@]}" 2>&1); then
+        printf 'Search domains not applied: %s' "$(trim "$err")"
+        return 1
+      fi
+    fi
+  fi
+  return 0
+}
+
+result_json() {
+  local ok=$1 device=$2 message=$3
+  printf '{"ok":%s,"device":%s,"message":%s}\n' \
+    "$ok" \
+    "$([[ -n $device ]] && json_str "$device" || printf 'null')" \
+    "$(json_str "$(trim "$message")")"
+}
+
+cmd_connect() {
+  local profile=${1-} timeout=30 dns_server=""
+  local -a domains=()
+  shift || true
+  while (($#)); do
+    case $1 in
+      --dns-server) dns_server=${2-}; shift 2 ;;
+      --dns-domain) [[ -n ${2-} ]] && domains+=("$2"); shift 2 ;;
+      --timeout)    timeout=${2-30}; shift 2 ;;
+      *)            shift ;;
+    esac
+  done
+
+  have_openvpn3 || { result_json false "" "openvpn3 is not installed"; return 1; }
+  [[ -n $profile ]] || { result_json false "" "No VPN profile configured"; return 1; }
+
+  local out rc
+  if [[ $profile == /net/openvpn/v3/configuration/* ]]; then
+    out=$("$OVPN3" session-start --config-path "$profile" --background --timeout "$timeout" 2>&1)
+    rc=$?
+  else
+    profile=$(expand_home "$profile")
+    [[ -f $profile ]] || { result_json false "" "Profile not found: $profile"; return 1; }
+    out=$("$OVPN3" session-start --config "$profile" --background --timeout "$timeout" 2>&1)
+    rc=$?
+  fi
+  if ((rc != 0)); then
+    result_json false "" "${out:-openvpn3 session-start failed}"
+    return 1
+  fi
+
+  # session-start returns as soon as the session object exists; the tun device
+  # shows up a moment later, and the DNS wiring needs it by name.
+  local dev="" i
+  for ((i = 0; i < timeout; i++)); do
+    collect_sessions
+    dev=$ACTIVE_DEVICE
+    if [[ -n $dev ]] && "$IP_BIN" link show "$dev" >/dev/null 2>&1; then break; fi
+    dev=""
+    sleep 1
+  done
+
+  if [[ -z $dev ]]; then
+    result_json true "" "Session started, but no tun device appeared in ${timeout}s"
+    return 0
+  fi
+
+  local dns_msg=""
+  if [[ -n $dns_server || ${#domains[@]} -gt 0 ]]; then
+    if ! dns_msg=$(apply_dns "$dev" "$dns_server" ${domains[@]+"${domains[@]}"}); then
+      result_json true "$dev" "$dns_msg"
+      return 0
+    fi
+  fi
+  result_json true "$dev" ""
+}
+
+cmd_disconnect() {
+  local target=${1-}
+  have_openvpn3 || { result_json false "" "openvpn3 is not installed"; return 1; }
+
+  local out="" failures=0 count=0 path
+  if [[ -n $target && $target != --all ]]; then
+    out=$("$OVPN3" session-manage --path "$target" --disconnect 2>&1) || failures=1
+    count=1
+  else
+    collect_sessions
+    if ((SESSION_COUNT == 0)); then
+      result_json true "" "No active sessions"
+      return 0
+    fi
+    for path in "${SESSION_PATHS[@]}"; do
+      if ! out=$("$OVPN3" session-manage --path "$path" --disconnect 2>&1); then
+        failures=$((failures + 1))
+      fi
+      count=$((count + 1))
+    done
+  fi
+
+  if ((failures > 0)); then
+    result_json false "" "${out:-Could not disconnect session}"
+    return 1
+  fi
+  result_json true "" ""
+}
+
+cmd_dns() {
+  local dev=${1-} dns_server=""
+  local -a domains=()
+  shift || true
+  while (($#)); do
+    case $1 in
+      --dns-server) dns_server=${2-}; shift 2 ;;
+      --dns-domain) [[ -n ${2-} ]] && domains+=("$2"); shift 2 ;;
+      *)            shift ;;
+    esac
+  done
+  [[ -n $dev ]] || { result_json false "" "No device given"; return 1; }
+  local msg=""
+  if ! msg=$(apply_dns "$dev" "$dns_server" ${domains[@]+"${domains[@]}"}); then
+    result_json false "$dev" "$msg"
+    return 1
+  fi
+  result_json true "$dev" ""
+}
+
+usage() {
+  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+main() {
+  local cmd=${1-status}
+  shift || true
+  case $cmd in
+    status)     cmd_status "$@" ;;
+    profiles)   cmd_profiles "$@" ;;
+    connect)    cmd_connect "$@" ;;
+    disconnect) cmd_disconnect "$@" ;;
+    dns)        cmd_dns "$@" ;;
+    -h|--help|help) usage ;;
+    *)          printf '{"error":%s}\n' "$(json_str "Unknown command: $cmd")"; return 2 ;;
+  esac
+}
+
+main "$@"

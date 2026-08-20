@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 1,
+  "id": "linting.tunnelsnake",
+  "name": "Tunnelsnake",
+  "version": "1.0.0",
+  "author": "Leandro Ciric",
+  "license": "MIT",
+  "description": "OpenVPN 3 tunnel control in the Omarchy bar: connect, disconnect, and watch every running session at a glance.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Tunnelsnake",
+    "description": "Connect and disconnect OpenVPN 3 tunnels, and see which sessions are running.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "profile": "",
+      "profilesDir": "",
+      "dnsServer": "",
+      "dnsDomains": "",
+      "refreshIntervalSec": 15,
+      "connectTimeoutSec": 30,
+      "hideWhenIdle": false
+    },
+    "schema": [
+      {
+        "key": "profile",
+        "type": "path",
+        "label": "VPN profile",
+        "defaultValue": "",
+        "description": "The .ovpn file the switch connects to. Leave empty to use the first profile found in the profiles folder."
+      },
+      {
+        "key": "profilesDir",
+        "type": "path",
+        "label": "Profiles folder",
+        "defaultValue": "",
+        "description": "Folder scanned for .ovpn files. Imported openvpn3 configurations are always listed as well."
+      },
+      {
+        "key": "dnsServer",
+        "type": "string",
+        "label": "Tunnel DNS server",
+        "defaultValue": "",
+        "description": "Optional. Pinned on the tun device with resolvectl right after connecting."
+      },
+      {
+        "key": "dnsDomains",
+        "type": "string",
+        "label": "Tunnel search domains",
+        "defaultValue": "",
+        "description": "Optional, space separated. Prefix with ~ to route only that domain through the tunnel, e.g. ~internal.example.com."
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 600,
+        "step": 5,
+        "defaultValue": 15
+      },
+      {
+        "key": "connectTimeoutSec",
+        "type": "integer",
+        "label": "Connect timeout (seconds)",
+        "min": 5,
+        "max": 120,
+        "step": 5,
+        "defaultValue": 30
+      },
+      {
+        "key": "hideWhenIdle",
+        "type": "boolean",
+        "label": "Hide the icon when disconnected",
+        "defaultValue": false
+      }
+    ]
+  }
+}

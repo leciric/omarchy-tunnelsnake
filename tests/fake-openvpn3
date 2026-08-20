@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Stand-in for openvpn3, driven by TUNNELSNAKE_FAKE_STATE.
+case "$1" in
+  sessions-list)
+    if [[ ${TUNNELSNAKE_FAKE_STATE:-none} == none ]]; then
+      echo "No sessions available"
+      exit 0
+    fi
+    cat <<'OUT'
+-----------------------------------------------------------------------------
+        Path: /net/openvpn/v3/sessions/2f1c9e2ds4b1as9e12
+     Created: Thu Aug 20 09:14:02 2026                    PID: 44121
+       Owner: lint                                     Device: tun0
+ Config name: profile-720.ovpn                (Config path: /net/openvpn/v3/configuration/aa11)
+Session name: vpn.example.com
+      Status: Connection, Client connected
+-----------------------------------------------------------------------------
+        Path: /net/openvpn/v3/sessions/77aa11bb22cc33dd44
+     Created: Thu Aug 20 09:20:41 2026                    PID: 44987
+       Owner: lint                                     Device: tun1
+ Config name: backup.ovpn                     (Config path: /net/openvpn/v3/configuration/bb22)
+Session name: backup.example.com
+      Status: Connection, Connecting
+-----------------------------------------------------------------------------
+OUT
+    ;;
+  session-stats) echo '{"BYTES_IN":1048576,"BYTES_OUT":524288,"PACKETS_IN":900,"PACKETS_OUT":700}' ;;
+  configs-list)
+    cat <<'OUT'
+Configuration path
+Imported                                          Last used                 Used
+Name
+-----------------------------------------------------------------------------
+/net/openvpn/v3/configuration/aa11
+ Thu Aug 20 09:10:00 2026                          Thu Aug 20 09:14:02 2026     3
+ profile-720.ovpn
+-----------------------------------------------------------------------------
+OUT
+    ;;
+  session-start) echo "Session path: /net/openvpn/v3/sessions/2f1c9e2ds4b1as9e12" ;;
+  session-manage) echo "Session disconnected" ;;
+  *) echo "unknown: $*" >&2; exit 1 ;;
+esac
