@@ -118,9 +118,11 @@ function stateLabel(state, device) {
   }
 }
 
+// openvpn3 reports the config name as the full path when a session was started
+// straight from a file, which is far too long for a row. Keep the file name.
 function sessionTitle(session) {
   if (!session) return "Session"
-  var name = String(session.config || "").replace(/\.ovpn$/, "")
+  var name = String(session.config || "").split("/").pop().replace(/\.ovpn$/, "")
   if (name === "") name = String(session.name || "")
   if (name === "") name = shortPath(String(session.path || ""))
   return name

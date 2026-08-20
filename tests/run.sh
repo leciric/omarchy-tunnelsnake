@@ -56,6 +56,12 @@ out=$(TUNNELSNAKE_FAKE_STATE=failed "$snake" status)
 # "Client authentication failed" must not be mistaken for "waiting on auth".
 check "state"                "failed"     "$(jq -r .state <<<"$out")"
 
+echo "session titles"
+# Model.js turns the config field into the row title; the helper must hand it
+# the raw value, path and all, for that to be possible.
+out=$(TUNNELSNAKE_FAKE_STATE=up "$snake" status)
+check "keeps full path"      "/home/lint/vpn/work.ovpn" "$(jq -r '.sessions[0].config' <<<"$out")"
+
 echo "profiles"
 tmp=$(mktemp -d)
 touch "$tmp/office.ovpn" "$tmp/notes.txt"
