@@ -122,7 +122,7 @@ function stateLabel(state, device) {
 // straight from a file, which is far too long for a row. Keep the file name.
 function sessionTitle(session) {
   if (!session) return "Session"
-  var name = String(session.config || "").split("/").pop().replace(/\.ovpn$/, "")
+  var name = baseName(String(session.config || ""))
   if (name === "") name = String(session.name || "")
   if (name === "") name = shortPath(String(session.path || ""))
   return name
@@ -166,18 +166,28 @@ function homeRelative(path, home) {
   return value
 }
 
-// A session and a profile refer to the same tunnel when the file name matches
-// the config name openvpn3 recorded when the session started.
+// A session and a profile refer to the same tunnel when they agree on the
+// file. openvpn3 records the config name as a bare name for imported profiles
+// and as a full path for file-started ones, so compare on both.
 function isProfileActive(profile, sessions) {
   if (!profile || !Array.isArray(sessions)) return false
-  var name = String(profile.name || "").replace(/\.ovpn$/, "")
-  var file = String(profile.path || "").split("/").pop().replace(/\.ovpn$/, "")
+  var path = String(profile.path || "")
+  // An imported profile's "path" is a D-Bus object path, so its base name says
+  // nothing; openvpn3 records the profile name for those sessions instead.
+  var file = profile.kind === "imported"
+    ? baseName(String(profile.name || ""))
+    : (baseName(path) || baseName(String(profile.name || "")))
   for (var i = 0; i < sessions.length; i++) {
-    var config = String(sessions[i].config || "").replace(/\.ovpn$/, "")
-    if (config !== "" && (config === name || config === file)) return true
-    if (String(sessions[i].configPath || "") === String(profile.path || "")) return true
+    var config = String(sessions[i].config || "")
+    if (config === "") continue
+    if (config === path) return true
+    if (file !== "" && baseName(config) === file) return true
   }
   return false
+}
+
+function baseName(value) {
+  return String(value || "").split("/").pop().replace(/\.ovpn$/, "")
 }
 
 function splitWords(value) {
