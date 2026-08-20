@@ -1,43 +1,87 @@
 #!/usr/bin/env bash
-# Stand-in for openvpn3, driven by TUNNELSNAKE_FAKE_STATE.
+# Stand-in for openvpn3, driven by TUNNELSNAKE_FAKE_STATE. The layouts below are
+# copied from real `openvpn3 sessions-list` output (v27), including the two
+# shapes the Config name line takes and the way Device is left blank while a
+# session is still being set up.
+sep="-----------------------------------------------------------------------------"
+
 case "$1" in
   sessions-list)
-    if [[ ${TUNNELSNAKE_FAKE_STATE:-none} == none ]]; then
-      echo "No sessions available"
-      exit 0
-    fi
-    cat <<'OUT'
------------------------------------------------------------------------------
+    case "${TUNNELSNAKE_FAKE_STATE:-none}" in
+      none)
+        echo "No sessions available"
+        ;;
+      up)
+        cat <<OUT
+$sep
         Path: /net/openvpn/v3/sessions/2f1c9e2ds4b1as9e12
-     Created: Thu Aug 20 09:14:02 2026                    PID: 44121
-       Owner: lint                                     Device: tun0
- Config name: profile-720.ovpn                (Config path: /net/openvpn/v3/configuration/aa11)
+     Created: 2026-08-20 09:14:02                       PID: 44121
+       Owner: lint                                   Device: tun0
+ Config name: /home/lint/vpn/work.ovpn  (Config not available)
 Session name: vpn.example.com
       Status: Connection, Client connected
------------------------------------------------------------------------------
+$sep
         Path: /net/openvpn/v3/sessions/77aa11bb22cc33dd44
-     Created: Thu Aug 20 09:20:41 2026                    PID: 44987
-       Owner: lint                                     Device: tun1
- Config name: backup.ovpn                     (Config path: /net/openvpn/v3/configuration/bb22)
+     Created: 2026-08-20 09:20:41                       PID: 44987
+       Owner: lint                                   Device: tun1
+ Config name: backup.ovpn                (Config path: /net/openvpn/v3/configuration/bb22)
 Session name: backup.example.com
       Status: Connection, Connecting
------------------------------------------------------------------------------
+$sep
 OUT
+        ;;
+      auth)
+        cat <<OUT
+$sep
+        Path: /net/openvpn/v3/sessions/1f75b30bsb651s42c0
+     Created: 2026-08-20 11:49:34                       PID: 116641
+       Owner: lint                                   Device: 
+ Config name: /home/lint/vpn/work.ovpn  (Config not available)
+      Status: Web authentication required to connect
+$sep
+OUT
+        ;;
+      failed)
+        cat <<OUT
+$sep
+        Path: /net/openvpn/v3/sessions/1f75b30bsb651s42c0
+     Created: 2026-08-20 11:49:34                       PID: 116641
+       Owner: lint                                   Device: 
+ Config name: /home/lint/vpn/work.ovpn  (Config not available)
+      Status: Connection, Client authentication failed: Authentication failed
+$sep
+OUT
+        ;;
+    esac
     ;;
   session-stats) echo '{"BYTES_IN":1048576,"BYTES_OUT":524288,"PACKETS_IN":900,"PACKETS_OUT":700}' ;;
   configs-list)
-    cat <<'OUT'
+    cat <<OUT
 Configuration path
 Imported                                          Last used                 Used
 Name
------------------------------------------------------------------------------
+$sep
 /net/openvpn/v3/configuration/aa11
- Thu Aug 20 09:10:00 2026                          Thu Aug 20 09:14:02 2026     3
- profile-720.ovpn
------------------------------------------------------------------------------
+ 2026-08-20 09:10:00                               2026-08-20 09:14:02          3
+ work.ovpn
+$sep
 OUT
     ;;
-  session-start) echo "Session path: /net/openvpn/v3/sessions/2f1c9e2ds4b1as9e12" ;;
+  session-start)
+    if [[ ${TUNNELSNAKE_FAKE_STATE:-none} == auth ]]; then
+      cat <<'OUT'
+Session path: /net/openvpn/v3/sessions/1f75b30bsb651s42c0
+
+Web based authentication required to connect.
+Open the following URL to complete the sign in process:
+
+     https://vpn.example.com/sso/auth?token=abc123
+
+OUT
+    else
+      echo "Session path: /net/openvpn/v3/sessions/2f1c9e2ds4b1as9e12"
+    fi
+    ;;
   session-manage) echo "Session disconnected" ;;
   *) echo "unknown: $*" >&2; exit 1 ;;
 esac

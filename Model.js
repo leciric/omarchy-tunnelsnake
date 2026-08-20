@@ -58,7 +58,8 @@ function parseResult(raw) {
   return {
     ok: parsed.ok === true,
     device: String(parsed.device || ""),
-    message: String(parsed.message || "")
+    message: String(parsed.message || ""),
+    authUrl: String(parsed.authUrl || "")
   }
 }
 
@@ -85,9 +86,13 @@ function formatBytes(bytes) {
   return (index === 0 ? Math.round(n) : n.toFixed(n < 10 ? 1 : 0)) + " " + units[index]
 }
 
-// openvpn3 prints "Thu Aug 20 09:14:02 2026", which Date happily parses.
+// openvpn3 prints "2026-08-20 11:49:34" on current releases and
+// "Thu Aug 20 09:14:02 2026" on older ones; only the first needs a nudge to
+// become something Date.parse handles the same way everywhere.
 function uptimeText(created, nowMs) {
-  var started = Date.parse(String(created || ""))
+  var text = String(created || "")
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(text)) text = text.replace(" ", "T")
+  var started = Date.parse(text)
   if (!isFinite(started)) return ""
   var seconds = Math.floor(((nowMs || Date.now()) - started) / 1000)
   if (seconds < 0) return ""
@@ -103,6 +108,8 @@ function stateLabel(state, device) {
   switch (String(state)) {
     case "connected":    return device ? "Connected · " + device : "Connected"
     case "connecting":   return "Connecting…"
+    case "needs-auth":   return "Sign-in required"
+    case "failed":       return "Connection failed"
     case "paused":       return "Paused"
     case "missing":      return "openvpn3 not installed"
     case "disconnected": return "No tunnel"

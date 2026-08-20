@@ -61,10 +61,13 @@ Panel {
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property color iconColor: vpn.displayState === "connected" ? foreground : dim
-  readonly property string toggleHint: vpn.active ? "Disconnect the tunnel" : "Connect the tunnel"
+  readonly property string toggleHint: vpn.needsAuth
+    ? "Open the sign-in page"
+    : (vpn.active ? "Disconnect the tunnel" : "Connect the tunnel")
   readonly property bool headerHasCursor: cursorActive && focusSection === "header" && vpn.installed
   readonly property bool showSessions: vpn.sessions.length > 0
   readonly property bool showProfiles: vpn.profiles.length > 0
+  readonly property bool showAuth: vpn.displayState === "needs-auth" || vpn.displayState === "failed"
 
   function refresh() {
     vpn.refresh()
@@ -87,13 +90,40 @@ Panel {
     return vpn.profiles[Math.max(0, Math.min(profileIndex, vpn.profiles.length - 1))]
   }
 
+  // The sections actually on screen, top to bottom. Everything about cursor
+  // movement is derived from this, so a section appearing or vanishing needs
+  // no other change.
+  function sectionOrder() {
+    var order = ["header"]
+    if (showAuth) order.push("auth")
+    if (showSessions) order.push("sessions")
+    if (showProfiles) order.push("profiles")
+    return order
+  }
+
+  function sectionLength(section) {
+    if (section === "sessions") return vpn.sessions.length
+    if (section === "profiles") return vpn.profiles.length
+    return 1
+  }
+
+  function sectionCursor(section) {
+    if (section === "sessions") return sessionIndex
+    if (section === "profiles") return profileIndex
+    return 0
+  }
+
+  function setSectionCursor(section, value) {
+    if (section === "sessions") sessionIndex = value
+    else if (section === "profiles") profileIndex = value
+  }
+
   function ensureCursor() {
     if (sessionIndex >= vpn.sessions.length) sessionIndex = Math.max(0, vpn.sessions.length - 1)
     if (profileIndex >= vpn.profiles.length) profileIndex = Math.max(0, vpn.profiles.length - 1)
     if (sessionIndex < 0) sessionIndex = 0
     if (profileIndex < 0) profileIndex = 0
-    if (focusSection === "sessions" && !showSessions) focusSection = showProfiles ? "profiles" : "header"
-    if (focusSection === "profiles" && !showProfiles) focusSection = showSessions ? "sessions" : "header"
+    if (sectionOrder().indexOf(focusSection) === -1) focusSection = "header"
   }
 
   function moveCursor(dx, dy) {
@@ -101,41 +131,32 @@ Panel {
     ensureCursor()
     if (dy === 0) return
 
-    if (focusSection === "header") {
-      if (dy > 0) {
-        if (showSessions) { focusSection = "sessions"; sessionIndex = 0 }
-        else if (showProfiles) { focusSection = "profiles"; profileIndex = 0 }
-        scrollCursorIntoView()
-      }
-      return
-    }
+    var order = sectionOrder()
+    var at = order.indexOf(focusSection)
+    if (at === -1) { focusSection = order[0]; return }
 
-    if (focusSection === "sessions") {
-      if (dy < 0 && sessionIndex === 0) { setHeaderCursor(); return }
-      if (dy > 0 && sessionIndex === vpn.sessions.length - 1) {
-        if (showProfiles) { focusSection = "profiles"; profileIndex = 0; scrollCursorIntoView() }
-        return
-      }
-      sessionIndex = Math.max(0, Math.min(vpn.sessions.length - 1, sessionIndex + dy))
+    var next = sectionCursor(focusSection) + dy
+    if (next >= 0 && next < sectionLength(focusSection)) {
+      setSectionCursor(focusSection, next)
       scrollCursorIntoView()
       return
     }
 
-    if (focusSection === "profiles") {
-      if (dy < 0 && profileIndex === 0) {
-        if (showSessions) { focusSection = "sessions"; sessionIndex = vpn.sessions.length - 1; scrollCursorIntoView() }
-        else setHeaderCursor()
-        return
-      }
-      profileIndex = Math.max(0, Math.min(vpn.profiles.length - 1, profileIndex + dy))
-      scrollCursorIntoView()
-    }
+    var section = at + (dy > 0 ? 1 : -1)
+    if (section < 0 || section >= order.length) return
+    focusSection = order[section]
+    setSectionCursor(focusSection, dy > 0 ? 0 : Math.max(0, sectionLength(focusSection) - 1))
+    if (focusSection === "header" && panelFlick) panelFlick.contentY = 0
+    scrollCursorIntoView()
   }
 
   function activateCursor() {
     ensureCursor()
     if (focusSection === "header") vpn.toggleTunnel()
-    else if (focusSection === "sessions") {
+    else if (focusSection === "auth") {
+      if (vpn.needsAuth) vpn.openAuthUrl()
+      else vpn.reconnect()
+    } else if (focusSection === "sessions") {
       var session = selectedSession()
       if (session) vpn.disconnectSession(session.path)
     } else if (focusSection === "profiles") {
@@ -314,6 +335,11 @@ Panel {
             wrapMode: Text.WordWrap
           }
 
+          AuthRow {
+            visible: root.showAuth
+            width: parent.width
+          }
+
           Column {
             visible: vpn.displayState === "connected"
             width: parent.width
@@ -444,6 +470,81 @@ Panel {
     PropertyAnimation {
       target: hero; property: "metaOpacity"
       to: 1.0; duration: 260; easing.type: Easing.InQuad
+    }
+  }
+
+  // openvpn3 parks SSO profiles until the sign-in URL is visited, and drops
+  // them on a failed handshake. Both states need one click to move forward.
+  component AuthRow: CursorSurface {
+    id: authRow
+    readonly property bool signIn: vpn.needsAuth
+
+    hasCursor: root.cursorActive && root.focusSection === "auth"
+    foreground: root.foreground
+    implicitHeight: authContent.implicitHeight + Style.spacing.rowPaddingX
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onEntered: {
+        root.cursorActive = true
+        root.focusSection = "auth"
+      }
+      onClicked: authRow.signIn ? vpn.openAuthUrl() : vpn.reconnect()
+    }
+
+    RowLayout {
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(10)
+      spacing: Style.space(8)
+
+      Text {
+        text: authRow.signIn ? "󰌾" : "󰜺"
+        color: root.urgent
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.icon
+        Layout.alignment: Qt.AlignVCenter
+      }
+
+      ColumnLayout {
+        id: authContent
+        Layout.fillWidth: true
+        spacing: Style.space(1)
+
+        Text {
+          Layout.fillWidth: true
+          text: authRow.signIn ? "Sign in to finish connecting" : "Connection failed — try again"
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          elide: Text.ElideRight
+        }
+
+        Text {
+          Layout.fillWidth: true
+          text: authRow.signIn
+            ? (vpn.authUrl !== "" ? "Reopen the sign-in page in your browser" : "Reconnect to get a new sign-in link")
+            : "Drop the dead session and reconnect"
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+      }
+
+      PanelActionButton {
+        iconText: authRow.signIn ? "󰖟" : "󰑐"
+        tooltipText: authRow.signIn ? "Open sign-in page" : "Reconnect"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        enabled: !vpn.busy
+        Layout.alignment: Qt.AlignVCenter
+        onClicked: authRow.signIn ? vpn.openAuthUrl() : vpn.reconnect()
+      }
     }
   }
 

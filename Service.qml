@@ -16,7 +16,8 @@ Item {
   readonly property string helperPath: pluginDir === "" ? "" : pluginDir + "/bin/tunnelsnake"
 
   property bool installed: true
-  // disconnected | connecting | connected | paused | missing | unknown
+  // disconnected | connecting | needs-auth | connected | failed | paused |
+  // missing | unknown
   property string tunnelState: "disconnected"
   property string activePath: ""
   property var sessions: []
@@ -27,6 +28,9 @@ Item {
   property var dnsDomains: []
   property real bytesIn: 0
   property real bytesOut: 0
+  // The one-time sign-in URL from the last connect, kept so the panel can
+  // reopen it if the browser tab was closed.
+  property string authUrl: ""
   property string actionStatus: ""
   property string lastError: ""
   property bool refreshing: false
@@ -44,10 +48,16 @@ Item {
   // What the icon and the hero draw: a pending request outranks the last poll.
   readonly property string displayState: {
     if (!installed) return "missing"
+    // A session parked on sign-in or dead on a failed handshake is a real
+    // answer; never paint it as still-connecting just because a request is in
+    // flight.
+    if (tunnelState === "needs-auth" || tunnelState === "failed") return tunnelState
     if (_desired === 1 && tunnelState !== "connected") return "connecting"
     if (_desired === 0 && tunnelState !== "disconnected") return "connecting"
     return tunnelState
   }
+
+  readonly property bool needsAuth: displayState === "needs-auth"
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 15, 5, 600)
   readonly property int connectTimeoutSec: intSetting("connectTimeoutSec", 30, 5, 120)
@@ -147,8 +157,33 @@ Item {
 
   function toggleTunnel() {
     if (busy) return
+    if (needsAuth) { openAuthUrl(); return }
     if (active) disconnectAll()
     else connectProfile("")
+  }
+
+  function openAuthUrl() {
+    if (authUrl === "") { reconnect(); return }
+    Qt.openUrlExternally(authUrl)
+    actionStatus = "Opened the sign-in page"
+    actionStatusTimer.restart()
+  }
+
+  // openvpn3 hands out a sign-in URL once per session, so getting a fresh one
+  // means dropping the parked session and starting over.
+  function reconnect() {
+    var target = defaultProfile()
+    if (target === "") {
+      lastError = "No VPN profile configured — pick one in the widget settings"
+      return
+    }
+    if (helperPath === "" || actionProcess.running) return
+    lastError = ""
+    authUrl = ""
+    actionStatus = "Reconnecting…"
+    _desired = 1
+    actionProcess.command = [helperPath, "reconnect", target, "--timeout", String(connectTimeoutSec)].concat(dnsArgs())
+    actionProcess.running = true
   }
 
   function applyStatus(raw) {
@@ -171,6 +206,10 @@ Item {
     // Reality caught up with the pending connect/disconnect — stop overriding.
     if (_desired === 1 && tunnelState === "connected") _desired = -1
     if (_desired === 0 && tunnelState === "disconnected") _desired = -1
+    // Neither of those will ever arrive while the session waits for a sign-in
+    // or after the handshake failed, so let go of the optimistic state.
+    if (tunnelState === "needs-auth" || tunnelState === "failed") _desired = -1
+    if (tunnelState === "disconnected") authUrl = ""
   }
 
   function elide(text) {
@@ -266,10 +305,16 @@ Item {
     stderr: StdioCollector { id: actionStderr; waitForEnd: true }
     onExited: function(exitCode) {
       var result = Model.parseResult(actionStdout.text)
+      if (result.authUrl !== "") {
+        root.authUrl = result.authUrl
+        Qt.openUrlExternally(result.authUrl)
+      }
       if (exitCode === 0 && result.ok) {
         // A message on a successful action means the tunnel came up but
         // something secondary did not, such as the DNS wiring.
-        root.actionStatus = result.message !== "" ? root.elide(result.message) : ""
+        root.actionStatus = result.authUrl !== ""
+          ? "Opened the sign-in page"
+          : (result.message !== "" ? root.elide(result.message) : "")
         root.lastError = ""
       } else {
         root._desired = -1

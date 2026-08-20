@@ -10,6 +10,7 @@
 #   status                      Sessions, link details, and transfer counters
 #   profiles [DIR ...]          .ovpn files in DIRs plus openvpn3-imported configs
 #   connect PROFILE [opts]      Start a session, wait for the tun device, wire DNS
+#   reconnect PROFILE [opts]    Drop every session first, then connect
 #   disconnect [SESSION_PATH]   Disconnect one session, or all of them
 #   dns DEVICE [opts]           Re-apply DNS to a device that is already up
 #
@@ -81,11 +82,15 @@ state_from_status() {
   local s=${1-}
   s=${s,,}
   case $s in
-    *"client connected"*|*"connection, connected"*) printf 'connected' ;;
-    *paused*)                                      printf 'paused' ;;
+    *"client connected"*|*"connection, connected"*)      printf 'connected' ;;
+    # Checked before the generic auth match: "authentication failed" is a dead
+    # session, not one waiting for you.
+    *fail*|*error*|*denied*|*expired*)                   printf 'failed' ;;
+    *"web authentication"*|*"authentication required"*)  printf 'needs-auth' ;;
+    *paused*)                                            printf 'paused' ;;
     *connecting*|*resolv*|*wait*|*auth*|*reconnect*|*"client restart"*) printf 'connecting' ;;
-    *disconnect*)                                  printf 'disconnected' ;;
-    *)                                             printf 'unknown' ;;
+    *disconnect*)                                        printf 'disconnected' ;;
+    *)                                                   printf 'unknown' ;;
   esac
 }
 
@@ -146,7 +151,7 @@ collect_sessions() {
         ;;
       "Config name:"*)
         config=$(trim "${trimmed#Config name:}")
-        config=$(trim "${config%%'(Config path:'*}")
+        [[ $config =~ ^(.*[^[:space:]])[[:space:]]*\([^\)]*\)$ ]] && config=${BASH_REMATCH[1]}
         ;;
       "Session name:"*)
         name=$(trim "${trimmed#Session name:}")
@@ -282,11 +287,18 @@ apply_dns() {
 }
 
 result_json() {
-  local ok=$1 device=$2 message=$3
-  printf '{"ok":%s,"device":%s,"message":%s}\n' \
+  local ok=$1 device=$2 message=$3 auth_url=${4-}
+  printf '{"ok":%s,"device":%s,"message":%s,"authUrl":%s}\n' \
     "$ok" \
     "$([[ -n $device ]] && json_str "$device" || printf 'null')" \
-    "$(json_str "$(trim "$message")")"
+    "$(json_str "$(trim "$message")")" \
+    "$([[ -n $auth_url ]] && json_str "$auth_url" || printf 'null')"
+}
+
+# Profiles behind an SSO portal make openvpn3 print a one-time sign-in URL and
+# then wait. It is only ever in the session-start output, so pull it out there.
+extract_auth_url() {
+  grep -oE 'https?://[^[:space:]]+' <<<"${1-}" | head -1
 }
 
 cmd_connect() {
@@ -316,15 +328,22 @@ cmd_connect() {
     rc=$?
   fi
   if ((rc != 0)); then
-    result_json false "" "${out:-openvpn3 session-start failed}"
+    result_json false "" "${out:-openvpn3 session-start failed}" "$(extract_auth_url "$out")"
     return 1
   fi
+
+  local auth_url
+  auth_url=$(extract_auth_url "$out")
 
   # session-start returns as soon as the session object exists; the tun device
   # shows up a moment later, and the DNS wiring needs it by name.
   local dev="" i
   for ((i = 0; i < timeout; i++)); do
     collect_sessions
+    if [[ $ACTIVE_STATE == needs-auth ]]; then
+      result_json true "" "Sign-in required to finish connecting" "$auth_url"
+      return 0
+    fi
     dev=$ACTIVE_DEVICE
     if [[ -n $dev ]] && "$IP_BIN" link show "$dev" >/dev/null 2>&1; then break; fi
     dev=""
@@ -332,7 +351,7 @@ cmd_connect() {
   done
 
   if [[ -z $dev ]]; then
-    result_json true "" "Session started, but no tun device appeared in ${timeout}s"
+    result_json true "" "Session started, but no tun device appeared in ${timeout}s" "$auth_url"
     return 0
   fi
 
@@ -344,6 +363,18 @@ cmd_connect() {
     fi
   fi
   result_json true "$dev" ""
+}
+
+# A session stuck waiting for sign-in cannot hand out a second URL, so the only
+# way back is to drop it and start over.
+cmd_reconnect() {
+  have_openvpn3 || { result_json false "" "openvpn3 is not installed"; return 1; }
+  collect_sessions
+  local path
+  for path in ${SESSION_PATHS[@]+"${SESSION_PATHS[@]}"}; do
+    "$OVPN3" session-manage --path "$path" --disconnect >/dev/null 2>&1
+  done
+  cmd_connect "$@"
 }
 
 cmd_disconnect() {
@@ -407,6 +438,7 @@ main() {
     profiles)   cmd_profiles "$@" ;;
     connect)    cmd_connect "$@" ;;
     disconnect) cmd_disconnect "$@" ;;
+    reconnect)  cmd_reconnect "$@" ;;
     dns)        cmd_dns "$@" ;;
     -h|--help|help) usage ;;
     *)          printf '{"error":%s}\n' "$(json_str "Unknown command: $cmd")"; return 2 ;;

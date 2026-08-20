@@ -22,8 +22,13 @@ BarWidget {
   readonly property bool hidden: setting("hideWhenIdle", false) === true
     && tunnelState !== "connected" && tunnelState !== "connecting"
 
+  readonly property bool needsAttention: tunnelState === "needs-auth" || tunnelState === "failed"
+
   readonly property color barForeground: bar ? bar.barForeground : Color.foreground
-  readonly property color iconColor: tunnelState === "connected" ? barForeground : Qt.darker(barForeground, 1.55)
+  readonly property color barUrgent: bar ? bar.urgent : Color.urgent
+  readonly property color iconColor: tunnelState === "connected"
+    ? barForeground
+    : (needsAttention ? barUrgent : Qt.darker(barForeground, 1.55))
 
   function injectPanel() {
     var target = panelLoader.item
@@ -82,15 +87,16 @@ BarWidget {
           }
         }
 
-        // More than one tunnel at once is unusual enough to call out.
+        // A tunnel waiting on sign-in, or a dead one, is worth a mark; so is
+        // more than one session at once.
         Text {
-          visible: root.sessionCount > 1
+          visible: root.needsAttention || root.sessionCount > 1
           anchors.right: barIcon.right
           anchors.top: barIcon.top
           anchors.rightMargin: -Style.space(2)
           anchors.topMargin: -Style.space(2)
-          text: String(root.sessionCount)
-          color: Color.accent
+          text: root.needsAttention ? "!" : String(root.sessionCount)
+          color: root.needsAttention ? root.barUrgent : Color.accent
           font.family: button.fontFamily
           font.pixelSize: Math.max(7, Math.round(button.fontSize * 0.5))
           font.bold: true
