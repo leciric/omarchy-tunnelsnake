@@ -23,6 +23,7 @@ function parseStatus(raw) {
     installed: parsed.installed === true,
     state: String(parsed.state || "disconnected"),
     activePath: String(parsed.activePath || ""),
+    authUrl: String(parsed.authUrl || ""),
     sessionCount: Number(parsed.sessionCount || sessions.length),
     sessions: sessions,
     device: String(link.device || ""),

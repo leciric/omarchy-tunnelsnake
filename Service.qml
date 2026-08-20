@@ -28,9 +28,13 @@ Item {
   property var dnsDomains: []
   property real bytesIn: 0
   property real bytesOut: 0
-  // The one-time sign-in URL from the last connect, kept so the panel can
-  // reopen it if the browser tab was closed.
+  // Live sign-in URL, re-read from openvpn3 on every poll for as long as the
+  // session sits waiting, so it survives a shell restart and can be reopened
+  // as many times as the browser tab gets lost.
   property string authUrl: ""
+  // Set while a connect we started is still expected to produce a URL, so the
+  // browser opens by itself once — and only once, not on every poll.
+  property bool _autoOpenAuth: false
   property string actionStatus: ""
   property string lastError: ""
   property bool refreshing: false
@@ -132,6 +136,7 @@ Item {
     if (helperPath === "" || actionProcess.running) return
     lastError = ""
     actionStatus = "Connecting…"
+    _autoOpenAuth = true
     _desired = 1
     actionProcess.command = [helperPath, "connect", target, "--timeout", String(connectTimeoutSec)].concat(dnsArgs())
     actionProcess.running = true
@@ -162,9 +167,12 @@ Item {
     else connectProfile("")
   }
 
+  // Qt.openUrlExternally goes through QDesktopServices inside the shell
+  // process; omarchy-launch-browser is what the rest of Omarchy uses, and it
+  // resolves the default browser, detaches, and focuses the window.
   function openAuthUrl() {
     if (authUrl === "") { reconnect(); return }
-    Qt.openUrlExternally(authUrl)
+    Quickshell.execDetached(["omarchy-launch-browser", authUrl])
     actionStatus = "Opened the sign-in page"
     actionStatusTimer.restart()
   }
@@ -181,6 +189,7 @@ Item {
     lastError = ""
     authUrl = ""
     actionStatus = "Reconnecting…"
+    _autoOpenAuth = true
     _desired = 1
     actionProcess.command = [helperPath, "reconnect", target, "--timeout", String(connectTimeoutSec)].concat(dnsArgs())
     actionProcess.running = true
@@ -195,6 +204,7 @@ Item {
     installed = parsed.installed
     tunnelState = parsed.state
     activePath = parsed.activePath
+    authUrl = parsed.authUrl
     sessions = parsed.sessions
     device = parsed.device
     ipv4 = parsed.ipv4
@@ -209,7 +219,11 @@ Item {
     // Neither of those will ever arrive while the session waits for a sign-in
     // or after the handshake failed, so let go of the optimistic state.
     if (tunnelState === "needs-auth" || tunnelState === "failed") _desired = -1
-    if (tunnelState === "disconnected") authUrl = ""
+    if (_autoOpenAuth && tunnelState === "needs-auth" && authUrl !== "") {
+      _autoOpenAuth = false
+      openAuthUrl()
+    }
+    if (tunnelState !== "needs-auth") _autoOpenAuth = false
   }
 
   function elide(text) {
@@ -305,16 +319,13 @@ Item {
     stderr: StdioCollector { id: actionStderr; waitForEnd: true }
     onExited: function(exitCode) {
       var result = Model.parseResult(actionStdout.text)
-      if (result.authUrl !== "") {
-        root.authUrl = result.authUrl
-        Qt.openUrlExternally(result.authUrl)
-      }
+      // The refresh below re-reads the URL from openvpn3 and opens it; taking
+      // it from here too would open the browser twice.
+      if (result.authUrl !== "") root.authUrl = result.authUrl
       if (exitCode === 0 && result.ok) {
         // A message on a successful action means the tunnel came up but
         // something secondary did not, such as the DNS wiring.
-        root.actionStatus = result.authUrl !== ""
-          ? "Opened the sign-in page"
-          : (result.message !== "" ? root.elide(result.message) : "")
+        root.actionStatus = result.message !== "" ? root.elide(result.message) : ""
         root.lastError = ""
       } else {
         root._desired = -1

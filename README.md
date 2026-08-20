@@ -74,6 +74,28 @@ Set these in the widget's settings panel, or directly on its entry in
 Clicking a session disconnects it. Clicking a profile connects it, or
 disconnects it if it is the one already running.
 
+## SSO / web sign-in profiles
+
+`openvpn3 session-start --background` does not print the sign-in URL — it only
+reports that the session is running, and the session then parks on "Web
+authentication required to connect". The URL lives in `openvpn3 session-auth`
+for as long as the session waits there, so that is where the widget reads it
+from on every poll. Connecting opens your browser once by itself; if you lose
+the tab, the panel's sign-in row reopens the same URL. A parked session cannot
+hand out a second URL, so **Reconnect** drops it and starts over for a fresh
+link.
+
+## Scripting it
+
+```bash
+omarchy-shell linting.tunnelsnake status       # connected | connecting | needs-auth | failed | disconnected
+omarchy-shell linting.tunnelsnake connect
+omarchy-shell linting.tunnelsnake disconnect
+omarchy-shell linting.tunnelsnake reconnect    # fresh sign-in link
+omarchy-shell linting.tunnelsnake signin       # reopen the sign-in page
+omarchy-shell linting.tunnelsnake toggle       # the panel, not the tunnel
+```
+
 ## About the DNS prompt
 
 Pinning DNS on a link is a privileged operation, so `systemd-resolved` asks
@@ -102,13 +124,18 @@ qmllint -I "$OMARCHY_PATH/shell" *.qml    # use the Qt 6 qmllint
 omarchy plugin validate .
 ```
 
-`inotifywait` does not follow symlinks, so when the plugin is installed as a
-symlink the shell will not notice edits by itself. Re-create the symlink to
-trigger a reload:
+Two things to know while developing. `inotifywait` does not follow symlinks, so
+a symlinked plugin never reports its own edits — re-create the symlink to fire
+the watch. And a reload re-reads the manifest but keeps the already-compiled
+QML, so code changes need a shell restart:
 
 ```bash
-ln -sfn "$PWD" ~/.config/omarchy/plugins/linting.tunnelsnake
+ln -sfn "$PWD" ~/.config/omarchy/plugins/linting.tunnelsnake   # manifest/script changes
+omarchy restart shell                                          # QML changes
 ```
+
+`bin/tunnelsnake` is re-executed on every poll, so changes there are live
+immediately.
 
 ## Removing it
 

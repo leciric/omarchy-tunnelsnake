@@ -42,11 +42,14 @@ check "created drops PID"    "2026-08-20 09:14:02"                         "$(jq
 check "owner drops device"   "lint"                                        "$(jq -r '.sessions[0].owner' <<<"$out")"
 check "second is connecting" "connecting"                                  "$(jq -r '.sessions[1].state' <<<"$out")"
 check "transfer counters"    "1048576"                                     "$(jq -r '.stats.BYTES_IN' <<<"$out")"
+check "no url when connected" "null"                                       "$(jq -r .authUrl <<<"$out")"
 
 echo "status, waiting on web sign-in"
 out=$(TUNNELSNAKE_FAKE_STATE=auth "$snake" status)
 check "state"                "needs-auth" "$(jq -r .state <<<"$out")"
 check "no device yet"        ""           "$(jq -r '.sessions[0].device' <<<"$out")"
+check "sign-in url"          "https://sso.example.com/saml/redirect/?RelayState=vpnauth~~abc123" "$(jq -r .authUrl <<<"$out")"
+check "url on the session"   "https://sso.example.com/saml/redirect/?RelayState=vpnauth~~abc123" "$(jq -r '.sessions[0].authUrl' <<<"$out")"
 
 echo "status, failed handshake"
 out=$(TUNNELSNAKE_FAKE_STATE=failed "$snake" status)
@@ -75,8 +78,8 @@ check "connect with bad path"   "false" "$(jq -r .ok <<<"$out")"
 tmp=$(mktemp -d)
 touch "$tmp/work.ovpn"
 out=$(TUNNELSNAKE_FAKE_STATE=auth "$snake" connect "$tmp/work.ovpn" --timeout 2)
-check "sign-in url captured"    "https://vpn.example.com/sso/auth?token=abc123" "$(jq -r .authUrl <<<"$out")"
-check "does not wait for device" "Sign-in required to finish connecting"        "$(jq -r .message <<<"$out")"
+check "sign-in url captured"     "https://sso.example.com/saml/redirect/?RelayState=vpnauth~~abc123" "$(jq -r .authUrl <<<"$out")"
+check "does not wait for device" "Sign-in required to finish connecting" "$(jq -r .message <<<"$out")"
 rm -rf "$tmp"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

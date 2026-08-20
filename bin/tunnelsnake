@@ -72,9 +72,44 @@ have_openvpn3() { command -v "$OVPN3" >/dev/null 2>&1; }
 SESSIONS_JSON="[]"
 SESSION_COUNT=0
 SESSION_PATHS=()
+AUTH_URLS=()
 ACTIVE_PATH=""
 ACTIVE_DEVICE=""
 ACTIVE_STATE="disconnected"
+ACTIVE_AUTH_URL=""
+
+# `session-start --background` never prints the sign-in URL — it only says the
+# session is running. The URL lives in `session-auth`, for as long as the
+# session sits there waiting, which also means it survives a shell restart.
+load_auth_urls() {
+  local raw line trimmed path="" url=""
+  AUTH_URLS=()
+  raw=$("$OVPN3" session-auth 2>/dev/null)
+  while IFS= read -r line; do
+    trimmed=$(trim "$line")
+    case $trimmed in
+      Path:*)
+        path=$(trim "${trimmed#Path:}")
+        ;;
+      "Auth URL:"*)
+        url=$(trim "${trimmed#Auth URL:}")
+        if [[ -n $path && -n $url ]]; then
+          AUTH_URLS+=("$path"$'\t'"$url")
+        fi
+        path=""
+        url=""
+        ;;
+    esac
+  done <<<"$raw"
+}
+
+auth_url_for() {
+  local wanted=${1-} entry
+  for entry in ${AUTH_URLS[@]+"${AUTH_URLS[@]}"}; do
+    [[ ${entry%%$'\t'*} == "$wanted" ]] && { printf '%s' "${entry#*$'\t'}"; return 0; }
+  done
+  printf ''
+}
 
 # openvpn3 reports "Connection, Client connected" and friends; collapse the
 # variants into the four states the widget actually draws.
@@ -105,13 +140,15 @@ collect_sessions() {
   ACTIVE_PATH=""
   ACTIVE_DEVICE=""
   ACTIVE_STATE="disconnected"
+  ACTIVE_AUTH_URL=""
 
   # Bash is dynamically scoped, so this helper reads and resets the record
   # variables declared above.
   _flush_session() {
     [[ -z $path ]] && return 0
-    local state
+    local state auth_url
     state=$(state_from_status "$status")
+    auth_url=$(auth_url_for "$path")
     [[ -n $items ]] && items+=","
     items+="{\"path\":$(json_str "$path")"
     items+=",\"created\":$(json_str "$created")"
@@ -120,7 +157,8 @@ collect_sessions() {
     items+=",\"config\":$(json_str "$config")"
     items+=",\"name\":$(json_str "$name")"
     items+=",\"status\":$(json_str "$status")"
-    items+=",\"state\":$(json_str "$state")}"
+    items+=",\"state\":$(json_str "$state")"
+    items+=",\"authUrl\":$([[ -n $auth_url ]] && json_str "$auth_url" || printf 'null')}"
     SESSION_PATHS+=("$path")
     count=$((count + 1))
     # The connected session wins the "active" slot; otherwise the first one
@@ -129,11 +167,15 @@ collect_sessions() {
       ACTIVE_PATH=$path
       ACTIVE_DEVICE=$device
       ACTIVE_STATE=$state
+      ACTIVE_AUTH_URL=$auth_url
     fi
     path=""; created=""; owner=""; device=""; config=""; name=""; status=""
   }
 
   raw=$("$OVPN3" sessions-list 2>&1)
+  # Only worth a second D-Bus round trip when something is actually parked.
+  if [[ ${raw,,} == *authentication* ]]; then load_auth_urls; else AUTH_URLS=(); fi
+
   while IFS= read -r line; do
     trimmed=$(trim "$line")
     case $trimmed in
@@ -203,12 +245,13 @@ stats_json() {
 
 cmd_status() {
   if ! have_openvpn3; then
-    printf '{"installed":false,"state":"missing","activePath":"","sessionCount":0,"sessions":[],"link":null,"stats":null,"error":"openvpn3 is not installed"}\n'
+    printf '{"installed":false,"state":"missing","activePath":"","authUrl":null,"sessionCount":0,"sessions":[],"link":null,"stats":null,"error":"openvpn3 is not installed"}\n'
     return 0
   fi
   collect_sessions
-  printf '{"installed":true,"state":%s,"activePath":%s,"sessionCount":%d,"sessions":%s,"link":%s,"stats":%s,"error":null}\n' \
-    "$(json_str "$ACTIVE_STATE")" "$(json_str "$ACTIVE_PATH")" "$SESSION_COUNT" \
+  printf '{"installed":true,"state":%s,"activePath":%s,"authUrl":%s,"sessionCount":%d,"sessions":%s,"link":%s,"stats":%s,"error":null}\n' \
+    "$(json_str "$ACTIVE_STATE")" "$(json_str "$ACTIVE_PATH")" \
+    "$([[ -n $ACTIVE_AUTH_URL ]] && json_str "$ACTIVE_AUTH_URL" || printf 'null')" "$SESSION_COUNT" \
     "$SESSIONS_JSON" "$(link_json "$ACTIVE_DEVICE")" "$(stats_json "$ACTIVE_PATH")"
 }
 
@@ -341,7 +384,7 @@ cmd_connect() {
   for ((i = 0; i < timeout; i++)); do
     collect_sessions
     if [[ $ACTIVE_STATE == needs-auth ]]; then
-      result_json true "" "Sign-in required to finish connecting" "$auth_url"
+      result_json true "" "Sign-in required to finish connecting" "${ACTIVE_AUTH_URL:-$auth_url}"
       return 0
     fi
     dev=$ACTIVE_DEVICE

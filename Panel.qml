@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import Quickshell
+import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "Model.js" as Model
@@ -219,6 +220,24 @@ Panel {
     id: vpn
     settings: root.settings
     pluginDir: root.pluginDir
+  }
+
+  // Scriptable from hooks and keybindings: `omarchy-shell linting.tunnelsnake
+  // signin`, `... connect`, `... status`, and so on.
+  IpcHandler {
+    target: root.ipcTarget
+
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function show(): void { root.open() }
+    function hide(): void { root.close() }
+    function toggle(): void { root.toggle() }
+    function refresh(): string { root.refresh(); return "ok" }
+    function connect(): string { vpn.connectProfile(""); return "ok" }
+    function disconnect(): string { vpn.disconnectAll(); return "ok" }
+    function reconnect(): string { vpn.reconnect(); return "ok" }
+    function signin(): string { vpn.openAuthUrl(); return vpn.authUrl !== "" ? vpn.authUrl : "no sign-in pending" }
+    function status(): string { return vpn.displayState }
   }
 
   Connections {
@@ -527,7 +546,7 @@ Panel {
         Text {
           Layout.fillWidth: true
           text: authRow.signIn
-            ? (vpn.authUrl !== "" ? "Reopen the sign-in page in your browser" : "Reconnect to get a new sign-in link")
+            ? (vpn.authUrl !== "" ? "Open the sign-in page in your browser" : "Reconnect to get a new sign-in link")
             : "Drop the dead session and reconnect"
           color: root.dim
           font.family: root.fontFamily
