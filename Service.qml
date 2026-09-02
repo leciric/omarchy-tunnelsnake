@@ -40,6 +40,24 @@ Item {
   property bool refreshing: false
   property double nowMs: Date.now()
 
+  // The file picker's view of one directory. The helper walks the disk, this
+  // holds the answer, and Panel.qml draws it.
+  property string browseDir: ""
+  property string browseParent: ""
+  property var browseEntries: []
+  property bool browseTruncated: false
+  property bool browseHidden: false
+  property string browseError: ""
+  property bool browsing: false
+  // Navigating is faster than a Process round trip, so remember where the last
+  // click wanted to go instead of dropping it.
+  property string _queuedBrowse: ""
+  property bool _hasQueuedBrowse: false
+  // What to say once a settings write lands. Held here because the answer
+  // arrives on a process exit, long after the click that caused it.
+  property string _saveMessage: ""
+  property bool _reloadProfilesAfterAction: false
+
   // Connecting and disconnecting both take several seconds, so the switch
   // follows this optimistic value until reality catches up: -1 means "just
   // report what openvpn3 says", 0/1 means a request is still in flight.
@@ -86,12 +104,15 @@ Item {
   }
 
   // The configured profile wins; otherwise the first discovered one keeps the
-  // switch useful on a fresh install.
-  function defaultProfile() {
+  // switch useful on a fresh install. A property rather than a function alone,
+  // so the rows that mark the default repaint the moment it changes.
+  readonly property string activeProfile: {
     if (configuredProfile !== "") return configuredProfile
     if (profiles.length > 0) return profiles[0].path
     return ""
   }
+
+  function defaultProfile() { return activeProfile }
 
   function searchDirs() {
     var dirs = []
@@ -100,7 +121,10 @@ Item {
       var parent = configuredProfile.substring(0, configuredProfile.lastIndexOf("/"))
       if (parent !== "" && dirs.indexOf(parent) === -1) dirs.push(parent)
     }
-    var fallbacks = [home + "/.config/openvpn", home + "/openvpn", home + "/vpn"]
+    // Downloads is where a profile a colleague sent you lands; the rest are
+    // where one ends up once you have filed it.
+    var fallbacks = [home + "/.config/openvpn", home + "/openvpn", home + "/vpn",
+                     home + "/Downloads", "/etc/openvpn"]
     for (var i = 0; i < fallbacks.length; i++) {
       if (dirs.indexOf(fallbacks[i]) === -1) dirs.push(fallbacks[i])
     }
@@ -118,6 +142,72 @@ Item {
     if (helperPath === "" || profilesProcess.running) return
     profilesProcess.command = [helperPath, "profiles"].concat(searchDirs())
     profilesProcess.running = true
+  }
+
+  // Where the picker should open: whatever you are already pointed at, so the
+  // first thing on screen is the folder you would have navigated to anyway.
+  function browseStart() {
+    if (browseDir !== "") return browseDir
+    if (configuredProfile !== "") {
+      var parent = configuredProfile.substring(0, configuredProfile.lastIndexOf("/"))
+      if (parent !== "") return parent
+    }
+    if (profilesDir !== "") return profilesDir
+    return home
+  }
+
+  function browse(dir) {
+    var target = dir === undefined || dir === null ? "" : String(dir)
+    if (helperPath === "") return
+    if (browseProcess.running) {
+      _queuedBrowse = target
+      _hasQueuedBrowse = true
+      return
+    }
+    browsing = true
+    var args = [helperPath, "browse", target]
+    if (browseHidden) args.push("--hidden")
+    browseProcess.command = args
+    browseProcess.running = true
+  }
+
+  function toggleHidden() {
+    browseHidden = !browseHidden
+    browse(browseDir)
+  }
+
+  // The widget's own settings live in shell.json, which the shell owns; the
+  // helper hands the write to it over IPC and the bar patches this item's
+  // `settings` back in place, without rebuilding the panel under your cursor.
+  function saveSetting(key, value, message) {
+    if (helperPath === "" || settingProcess.running) return
+    lastError = ""
+    _saveMessage = message || ""
+    settingProcess.command = [helperPath, "set", String(key), String(value)]
+    settingProcess.running = true
+  }
+
+  function chooseProfile(path) {
+    if (!path) return
+    var stored = Model.homeRelative(String(path), home)
+    saveSetting("profile", stored, Model.baseName(String(path)) + " is now the default profile")
+  }
+
+  function chooseProfilesDir(dir) {
+    if (!dir) return
+    var stored = Model.homeRelative(String(dir), home)
+    saveSetting("profilesDir", stored, "Scanning " + stored + " for profiles")
+  }
+
+  // An imported profile survives the file being moved or deleted, and is what
+  // openvpn3 lists for every tool on the machine, not just this widget.
+  function importProfile(path) {
+    if (helperPath === "" || actionProcess.running || !path) return
+    lastError = ""
+    actionStatus = "Importing…"
+    _reloadProfilesAfterAction = true
+    actionProcess.command = [helperPath, "import", String(path)]
+    actionProcess.running = true
   }
 
   function dnsArgs() {
@@ -312,6 +402,54 @@ Item {
   }
 
   Process {
+    id: browseProcess
+    running: false
+    command: []
+    stdout: StdioCollector { id: browseStdout; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.browsing = false
+      if (exitCode === 0) {
+        var parsed = Model.parseBrowse(browseStdout.text)
+        if (parsed.ok) {
+          root.browseDir = parsed.dir
+          root.browseParent = parsed.parent
+          root.browseEntries = parsed.entries
+          root.browseTruncated = parsed.truncated
+        }
+        root.browseError = parsed.error
+      } else {
+        root.browseError = "Could not read that folder"
+      }
+      if (root._hasQueuedBrowse) {
+        var next = root._queuedBrowse
+        root._hasQueuedBrowse = false
+        root._queuedBrowse = ""
+        root.browse(next)
+      }
+    }
+  }
+
+  Process {
+    id: settingProcess
+    running: false
+    command: []
+    stdout: StdioCollector { id: settingStdout; waitForEnd: true }
+    stderr: StdioCollector { id: settingStderr; waitForEnd: true }
+    onExited: function(exitCode) {
+      var result = Model.parseResult(settingStdout.text)
+      if (exitCode === 0 && result.ok) {
+        root.actionStatus = root._saveMessage
+        if (root.actionStatus !== "") actionStatusTimer.restart()
+        // The setting is what decides which profiles are worth listing.
+        root.refreshProfiles()
+      } else {
+        root.lastError = root.elide(result.message || settingStderr.text || "Could not save the setting")
+      }
+      root._saveMessage = ""
+    }
+  }
+
+  Process {
     id: actionProcess
     running: false
     command: []
@@ -333,6 +471,10 @@ Item {
         root.actionStatus = ""
       }
       if (root.actionStatus !== "") actionStatusTimer.restart()
+      if (root._reloadProfilesAfterAction) {
+        root._reloadProfilesAfterAction = false
+        root.refreshProfiles()
+      }
       settleTimer.ticks = 0
       settleTimer.restart()
       root.refresh()

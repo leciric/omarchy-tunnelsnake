@@ -42,8 +42,14 @@ Panel {
   property string focusSection: "header"
   property int sessionIndex: 0
   property int profileIndex: 0
+  property int pickerIndex: 0
   property bool cursorActive: false
   property int phraseIndex: 0
+
+  // The file picker takes over the whole panel while it is open: browsing for
+  // a profile has nothing to say about the tunnel you are already running, and
+  // a folder deep in $HOME needs every row it can get.
+  property bool picking: false
 
   readonly property var activePhrases: [
     "Slithering through",
@@ -67,8 +73,28 @@ Panel {
     : (vpn.active ? "Disconnect the tunnel" : "Connect the tunnel")
   readonly property bool headerHasCursor: cursorActive && focusSection === "header" && vpn.installed
   readonly property bool showSessions: vpn.sessions.length > 0
-  readonly property bool showProfiles: vpn.profiles.length > 0
+  // Always on when openvpn3 is: the last row is the way into the file picker,
+  // and a fresh install with no profiles found is exactly when it is needed.
+  readonly property bool showProfiles: vpn.installed
   readonly property bool showAuth: vpn.displayState === "needs-auth" || vpn.displayState === "failed"
+
+  // The profiles you can dial, plus the row that opens the picker. Keeping the
+  // picker in the same list is what makes it reachable with the keyboard
+  // without teaching the cursor about a section with one row in it.
+  readonly property var profileRows: vpn.profiles.concat([{
+    kind: "browse",
+    name: "Choose a profile file…",
+    path: ""
+  }])
+
+  // What the picker draws: the way back out of the folder, then its contents.
+  readonly property var pickerRows: {
+    var rows = []
+    if (vpn.browseParent !== "") rows.push({ kind: "up", name: "..", path: vpn.browseParent })
+    var entries = vpn.browseEntries
+    for (var i = 0; i < entries.length; i++) rows.push(entries[i])
+    return rows
+  }
 
   function refresh() {
     vpn.refresh()
@@ -87,14 +113,49 @@ Panel {
   }
 
   function selectedProfile() {
-    if (vpn.profiles.length === 0) return null
-    return vpn.profiles[Math.max(0, Math.min(profileIndex, vpn.profiles.length - 1))]
+    if (profileRows.length === 0) return null
+    return profileRows[Math.max(0, Math.min(profileIndex, profileRows.length - 1))]
+  }
+
+  function selectedPickerRow() {
+    if (pickerRows.length === 0) return null
+    return pickerRows[Math.max(0, Math.min(pickerIndex, pickerRows.length - 1))]
+  }
+
+  function openPicker() {
+    picking = true
+    cursorActive = true
+    focusSection = "picker"
+    pickerIndex = 0
+    if (panelFlick) panelFlick.contentY = 0
+    vpn.browse(vpn.browseStart())
+  }
+
+  function closePicker() {
+    picking = false
+    focusSection = "header"
+    if (panelFlick) panelFlick.contentY = 0
+  }
+
+  function enterFolder(path) {
+    if (!path) return
+    vpn.browse(path)
+    pickerIndex = 0
+    if (panelFlick) panelFlick.contentY = 0
+  }
+
+  function activatePickerRow(entry) {
+    if (!entry) return
+    if (entry.kind === "up" || entry.kind === "dir") { enterFolder(entry.path); return }
+    vpn.chooseProfile(entry.path)
+    closePicker()
   }
 
   // The sections actually on screen, top to bottom. Everything about cursor
   // movement is derived from this, so a section appearing or vanishing needs
   // no other change.
   function sectionOrder() {
+    if (picking) return ["picker"]
     var order = ["header"]
     if (showAuth) order.push("auth")
     if (showSessions) order.push("sessions")
@@ -104,32 +165,48 @@ Panel {
 
   function sectionLength(section) {
     if (section === "sessions") return vpn.sessions.length
-    if (section === "profiles") return vpn.profiles.length
+    if (section === "profiles") return profileRows.length
+    if (section === "picker") return pickerRows.length
     return 1
   }
 
   function sectionCursor(section) {
     if (section === "sessions") return sessionIndex
     if (section === "profiles") return profileIndex
+    if (section === "picker") return pickerIndex
     return 0
   }
 
   function setSectionCursor(section, value) {
     if (section === "sessions") sessionIndex = value
     else if (section === "profiles") profileIndex = value
+    else if (section === "picker") pickerIndex = value
   }
 
   function ensureCursor() {
     if (sessionIndex >= vpn.sessions.length) sessionIndex = Math.max(0, vpn.sessions.length - 1)
-    if (profileIndex >= vpn.profiles.length) profileIndex = Math.max(0, vpn.profiles.length - 1)
+    if (profileIndex >= profileRows.length) profileIndex = Math.max(0, profileRows.length - 1)
+    if (pickerIndex >= pickerRows.length) pickerIndex = Math.max(0, pickerRows.length - 1)
     if (sessionIndex < 0) sessionIndex = 0
     if (profileIndex < 0) profileIndex = 0
-    if (sectionOrder().indexOf(focusSection) === -1) focusSection = "header"
+    if (pickerIndex < 0) pickerIndex = 0
+    if (sectionOrder().indexOf(focusSection) === -1) focusSection = picking ? "picker" : "header"
   }
 
   function moveCursor(dx, dy) {
     cursorActive = true
     ensureCursor()
+
+    // Left and right walk the folder tree, the way they do in every other file
+    // list: out to the parent, in to the folder under the cursor.
+    if (picking && dx !== 0) {
+      if (dx < 0) enterFolder(vpn.browseParent)
+      else {
+        var row = selectedPickerRow()
+        if (row && (row.kind === "dir" || row.kind === "up")) enterFolder(row.path)
+      }
+      return
+    }
     if (dy === 0) return
 
     var order = sectionOrder()
@@ -162,7 +239,12 @@ Panel {
       if (session) vpn.disconnectSession(session.path)
     } else if (focusSection === "profiles") {
       var profile = selectedProfile()
-      if (profile) vpn.connectProfile(profile.path)
+      if (!profile) return
+      if (profile.kind === "browse") openPicker()
+      else if (Model.isProfileActive(profile, vpn.sessions)) vpn.disconnectAll()
+      else vpn.connectProfile(profile.path)
+    } else if (focusSection === "picker") {
+      activatePickerRow(selectedPickerRow())
     }
   }
 
@@ -182,6 +264,12 @@ Panel {
     cursorActive = true
     focusSection = "profiles"
     profileIndex = index
+  }
+
+  function setPickerCursor(index) {
+    cursorActive = true
+    focusSection = "picker"
+    pickerIndex = index
   }
 
   function scrollItemIntoView(item) {
@@ -205,11 +293,14 @@ Panel {
       scrollItemIntoView(sessionColumn.children[sessionIndex])
     } else if (focusSection === "profiles" && profileColumn && profileIndex < profileColumn.children.length) {
       scrollItemIntoView(profileColumn.children[profileIndex])
+    } else if (focusSection === "picker" && pickerColumn && pickerIndex < pickerColumn.children.length) {
+      scrollItemIntoView(pickerColumn.children[pickerIndex])
     }
   }
 
   onOpenedChanged: if (opened) {
     cursorActive = false
+    picking = false
     focusSection = "header"
     if (panelFlick) panelFlick.contentY = 0
     refresh()
@@ -238,12 +329,15 @@ Panel {
     function reconnect(): string { vpn.reconnect(); return "ok" }
     function signin(): string { vpn.openAuthUrl(); return vpn.authUrl !== "" ? vpn.authUrl : "no sign-in pending" }
     function status(): string { return vpn.displayState }
+    function pick(): string { root.open(); root.openPicker(); return "ok" }
+    function profile(): string { return vpn.defaultProfile() }
   }
 
   Connections {
     target: vpn
     function onSessionsChanged() { root.ensureCursor() }
     function onProfilesChanged() { root.ensureCursor() }
+    function onBrowseEntriesChanged() { root.ensureCursor() }
   }
 
   KeyboardPanel {
@@ -264,12 +358,22 @@ Panel {
         root.moveCursor(dx, dy)
       }
       onActivateRequested: if (root.cursorActive) root.activateCursor()
-      onCloseRequested: root.close()
+      // Esc backs out of the picker before it closes the panel, so a wrong
+      // turn in a folder tree does not cost you the whole popup.
+      onCloseRequested: root.picking ? root.closePicker() : root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
-        if (t === "r" || t === "R") root.refresh()
-        else if (t === "c" || t === "C") vpn.connectProfile("")
-        else if (t === "d" || t === "D") vpn.disconnectAll()
+        var key = t.toLowerCase()
+        if (root.picking) {
+          // Nothing here should touch the tunnel; you are picking a file.
+          if (key === ".") vpn.toggleHidden()
+          else if (key === "u") root.enterFolder(vpn.browseParent)
+          return
+        }
+        if (key === "r") root.refresh()
+        else if (key === "c") vpn.connectProfile("")
+        else if (key === "d") vpn.disconnectAll()
+        else if (key === "f") root.openPicker()
       }
 
       Flickable {
@@ -288,181 +392,303 @@ Panel {
           width: panelFlick.width
           spacing: Style.space(12)
 
-          Item {
-            id: header
+          Column {
+            id: mainColumn
+            visible: !root.picking
             width: parent.width
-            implicitHeight: hero.implicitHeight
-            // The hero's trailingControl resolves `root` to PanelHero, so panel
-            // state is reached through this wrapper instead.
-            readonly property bool ringVisible: root.headerHasCursor
-            function focusHero() { root.setHeaderCursor() }
+            spacing: Style.space(12)
 
-            PanelHero {
-              id: hero
+            Item {
+              id: header
               width: parent.width
-              title: "Tunnelsnake"
-              meta: vpn.displayState === "connected" ? root.heroPhraseText : Model.stateLabel(vpn.displayState, vpn.device)
-              detail: vpn.displayState === "connected" && vpn.device !== "" ? vpn.device : ""
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              iconOpacity: vpn.displayState === "connected" ? 1.0 : 0.55
+              implicitHeight: hero.implicitHeight
+              // The hero's trailingControl resolves `root` to PanelHero, so panel
+              // state is reached through this wrapper instead.
+              readonly property bool ringVisible: root.headerHasCursor
+              function focusHero() { root.setHeaderCursor() }
 
-              iconComponent: Component {
-                TunnelIcon {
-                  iconSize: Style.font.display
-                  color: root.iconColor
-                  filled: vpn.displayState === "connected"
+              PanelHero {
+                id: hero
+                width: parent.width
+                title: "Tunnelsnake"
+                meta: vpn.displayState === "connected" ? root.heroPhraseText : Model.stateLabel(vpn.displayState, vpn.device)
+                detail: vpn.displayState === "connected" && vpn.device !== "" ? vpn.device : ""
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                iconOpacity: vpn.displayState === "connected" ? 1.0 : 0.55
 
-                  SequentialAnimation on pulse {
-                    running: vpn.displayState === "connecting"
-                    loops: Animation.Infinite
-                    alwaysRunToEnd: true
-                    NumberAnimation { to: 0.2; duration: 620; easing.type: Easing.InOutQuad }
-                    NumberAnimation { to: 1.0; duration: 620; easing.type: Easing.InOutQuad }
+                iconComponent: Component {
+                  TunnelIcon {
+                    iconSize: Style.font.display
+                    color: root.iconColor
+                    filled: vpn.displayState === "connected"
+
+                    SequentialAnimation on pulse {
+                      running: vpn.displayState === "connecting"
+                      loops: Animation.Infinite
+                      alwaysRunToEnd: true
+                      NumberAnimation { to: 0.2; duration: 620; easing.type: Easing.InOutQuad }
+                      NumberAnimation { to: 1.0; duration: 620; easing.type: Easing.InOutQuad }
+                    }
+                  }
+                }
+
+                trailingControl: Component {
+                  ToggleSwitch {
+                    id: powerSwitch
+                    visible: vpn.installed
+                    checked: vpn.active
+                    busy: vpn.busy
+                    hasCursor: header.ringVisible
+                    foreground: hero.foreground
+                    onHovered: function(on) { if (on) header.focusHero() }
+                    onToggled: vpn.toggleTunnel()
+
+                    PanelToolTip {
+                      visible: powerSwitch.containsMouse
+                      text: root.toggleHint
+                      fontFamily: hero.fontFamily
+                    }
                   }
                 }
               }
-
-              trailingControl: Component {
-                ToggleSwitch {
-                  id: powerSwitch
-                  visible: vpn.installed
-                  checked: vpn.active
-                  busy: vpn.busy
-                  hasCursor: header.ringVisible
-                  foreground: hero.foreground
-                  onHovered: function(on) { if (on) header.focusHero() }
-                  onToggled: vpn.toggleTunnel()
-
-                  PanelToolTip {
-                    visible: powerSwitch.containsMouse
-                    text: root.toggleHint
-                    fontFamily: hero.fontFamily
-                  }
-                }
-              }
-            }
-          }
-
-          Text {
-            visible: text !== ""
-            width: parent.width
-            text: vpn.actionStatus !== "" ? vpn.actionStatus : vpn.lastError
-            color: vpn.lastError !== "" && vpn.actionStatus === "" ? root.urgent : root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            wrapMode: Text.WordWrap
-          }
-
-          AuthRow {
-            visible: root.showAuth
-            width: parent.width
-          }
-
-          Column {
-            visible: vpn.displayState === "connected"
-            width: parent.width
-            spacing: Style.spacing.labelGap
-
-            InfoPair { label: "Interface"; value: vpn.device !== "" ? vpn.device : "—" }
-            InfoPair { label: "Address"; value: vpn.ipv4 !== "" ? vpn.ipv4 : "—" }
-            InfoPair { visible: vpn.dnsServers.length > 0; label: "DNS"; value: vpn.dnsServers.join(", ") }
-            InfoPair { visible: vpn.dnsDomains.length > 0; label: "Domains"; value: vpn.dnsDomains.join(" ") }
-            InfoPair {
-              visible: vpn.bytesIn > 0 || vpn.bytesOut > 0
-              label: "Transfer"
-              value: "↓ " + Model.formatBytes(vpn.bytesIn) + "   ↑ " + Model.formatBytes(vpn.bytesOut)
-            }
-          }
-
-          PanelSeparator {
-            visible: vpn.installed
-            foreground: root.foreground
-          }
-
-          Column {
-            visible: vpn.installed
-            width: parent.width
-            spacing: Style.space(10)
-
-            PanelSectionHeader {
-              text: "SESSIONS"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
             }
 
             Text {
-              visible: !root.showSessions
+              visible: text !== ""
               width: parent.width
-              text: "No tunnels running."
+              text: vpn.actionStatus !== "" ? vpn.actionStatus : vpn.lastError
+              color: vpn.lastError !== "" && vpn.actionStatus === "" ? root.urgent : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
+
+            AuthRow {
+              visible: root.showAuth
+              width: parent.width
+            }
+
+            Column {
+              visible: vpn.displayState === "connected"
+              width: parent.width
+              spacing: Style.spacing.labelGap
+
+              InfoPair { label: "Interface"; value: vpn.device !== "" ? vpn.device : "—" }
+              InfoPair { label: "Address"; value: vpn.ipv4 !== "" ? vpn.ipv4 : "—" }
+              InfoPair { visible: vpn.dnsServers.length > 0; label: "DNS"; value: vpn.dnsServers.join(", ") }
+              InfoPair { visible: vpn.dnsDomains.length > 0; label: "Domains"; value: vpn.dnsDomains.join(" ") }
+              InfoPair {
+                visible: vpn.bytesIn > 0 || vpn.bytesOut > 0
+                label: "Transfer"
+                value: "↓ " + Model.formatBytes(vpn.bytesIn) + "   ↑ " + Model.formatBytes(vpn.bytesOut)
+              }
+            }
+
+            PanelSeparator {
+              visible: vpn.installed
+              foreground: root.foreground
+            }
+
+            Column {
+              visible: vpn.installed
+              width: parent.width
+              spacing: Style.space(10)
+
+              PanelSectionHeader {
+                text: "SESSIONS"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Text {
+                visible: !root.showSessions
+                width: parent.width
+                text: "No tunnels running."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                horizontalAlignment: Text.AlignHCenter
+              }
+
+              Column {
+                id: sessionColumn
+                visible: root.showSessions
+                width: parent.width
+                spacing: Style.space(6)
+
+                Repeater {
+                  model: vpn.sessions
+                  SessionRow {
+                    required property var modelData
+                    required property int index
+                    width: sessionColumn.width
+                    session: modelData
+                    rowIndex: index
+                  }
+                }
+              }
+            }
+
+            PanelSeparator {
+              visible: root.showProfiles
+              foreground: root.foreground
+            }
+
+            Column {
+              visible: root.showProfiles
+              width: parent.width
+              spacing: Style.space(10)
+
+              PanelSectionHeader {
+                text: "PROFILES"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Column {
+                id: profileColumn
+                width: parent.width
+                spacing: Style.space(6)
+
+                Repeater {
+                  model: root.profileRows
+                  ProfileRow {
+                    required property var modelData
+                    required property int index
+                    width: profileColumn.width
+                    profile: modelData
+                    rowIndex: index
+                  }
+                }
+              }
+            }
+
+            Text {
+              visible: !vpn.installed
+              width: parent.width
+              text: "openvpn3 is not installed. Install it with: omarchy pkg add openvpn3"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+              horizontalAlignment: Text.AlignHCenter
+            }
+          }
+
+          // The picker. One folder at a time, walked with the same keys as the
+          // rest of the panel: up and down to move, left and right to leave and
+          // enter a folder, Enter to take what is under the cursor.
+          Column {
+            id: pickerView
+            visible: root.picking
+            width: parent.width
+            spacing: Style.space(10)
+
+            RowLayout {
+              width: parent.width
+              spacing: Style.space(8)
+
+              ColumnLayout {
+                Layout.fillWidth: true
+                spacing: Style.space(1)
+
+                PanelSectionHeader {
+                  text: "CHOOSE A PROFILE"
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                }
+
+                Text {
+                  Layout.fillWidth: true
+                  text: Model.homeRelative(vpn.browseDir, vpn.home)
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  // The tail of a path says which folder you are in; the head
+                  // only says how deep it is.
+                  elide: Text.ElideLeft
+                }
+              }
+
+              PanelActionButton {
+                iconText: vpn.browseHidden ? "󰈈" : "󰈉"
+                tooltipText: vpn.browseHidden ? "Hide dot-folders (.)" : "Show dot-folders (.)"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                Layout.alignment: Qt.AlignVCenter
+                onClicked: vpn.toggleHidden()
+              }
+
+              PanelActionButton {
+                iconText: "󰅖"
+                tooltipText: "Back to the panel (Esc)"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                Layout.alignment: Qt.AlignVCenter
+                onClicked: root.closePicker()
+              }
+            }
+
+            Text {
+              visible: text !== ""
+              width: parent.width
+              text: vpn.browseError !== "" ? vpn.browseError
+                : (vpn.browseTruncated ? "Too many entries to list — open a narrower folder." : "")
+              color: vpn.browseError !== "" ? root.urgent : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
+
+            Column {
+              id: pickerColumn
+              width: parent.width
+              spacing: Style.space(6)
+
+              Repeater {
+                model: root.pickerRows
+                PickerRow {
+                  required property var modelData
+                  required property int index
+                  width: pickerColumn.width
+                  entry: modelData
+                  rowIndex: index
+                }
+              }
+            }
+
+            Text {
+              visible: root.pickerRows.length === 0 && vpn.browseError === ""
+              width: parent.width
+              text: "No folders and no profiles here."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
               horizontalAlignment: Text.AlignHCenter
             }
 
-            Column {
-              id: sessionColumn
-              visible: root.showSessions
-              width: parent.width
-              spacing: Style.space(6)
-
-              Repeater {
-                model: vpn.sessions
-                SessionRow {
-                  required property var modelData
-                  required property int index
-                  width: sessionColumn.width
-                  session: modelData
-                  rowIndex: index
-                }
-              }
+            PanelSeparator {
+              foreground: root.foreground
             }
-          }
 
-          PanelSeparator {
-            visible: root.showProfiles
-            foreground: root.foreground
-          }
-
-          Column {
-            visible: root.showProfiles
-            width: parent.width
-            spacing: Style.space(10)
-
-            PanelSectionHeader {
-              text: "PROFILES"
+            // Picking one file sets the default profile; pointing the widget at
+            // the folder lists every profile in it instead, which is what you
+            // want when there is more than one tunnel to switch between.
+            Button {
+              width: parent.width
+              text: "Scan this folder for profiles"
+              iconText: "󰉋"
+              bordered: true
+              leftAlign: true
               foreground: root.foreground
               fontFamily: root.fontFamily
-            }
-
-            Column {
-              id: profileColumn
-              width: parent.width
-              spacing: Style.space(6)
-
-              Repeater {
-                model: vpn.profiles
-                ProfileRow {
-                  required property var modelData
-                  required property int index
-                  width: profileColumn.width
-                  profile: modelData
-                  rowIndex: index
-                }
+              enabled: vpn.browseDir !== ""
+              onClicked: {
+                vpn.chooseProfilesDir(vpn.browseDir)
+                root.closePicker()
               }
             }
-          }
-
-          Text {
-            visible: !vpn.installed
-            width: parent.width
-            text: "openvpn3 is not installed. Install it with: omarchy pkg add openvpn3"
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            wrapMode: Text.WordWrap
-            horizontalAlignment: Text.AlignHCenter
           }
         }
       }
@@ -642,8 +868,12 @@ Panel {
     id: profileRow
     property var profile: null
     property int rowIndex: 0
-    readonly property bool isActive: Model.isProfileActive(profileRow.profile, vpn.sessions)
-    readonly property bool isDefault: vpn.defaultProfile() === (profileRow.profile ? profileRow.profile.path : "")
+    // The last row in the list is not a profile at all: it is the way into the
+    // file picker, for the profile that is not in any folder we scan.
+    readonly property bool isBrowse: profileRow.profile && profileRow.profile.kind === "browse"
+    readonly property bool isActive: !isBrowse && Model.isProfileActive(profileRow.profile, vpn.sessions)
+    readonly property bool isDefault: !isBrowse && profileRow.profile
+      && vpn.activeProfile === profileRow.profile.path
 
     hasCursor: root.cursorActive && root.focusSection === "profiles" && root.profileIndex === rowIndex
     current: isActive
@@ -653,11 +883,12 @@ Panel {
     MouseArea {
       anchors.fill: parent
       hoverEnabled: true
-      cursorShape: vpn.busy ? Qt.ArrowCursor : Qt.PointingHandCursor
+      cursorShape: vpn.busy && !profileRow.isBrowse ? Qt.ArrowCursor : Qt.PointingHandCursor
       onEntered: root.setProfileCursor(profileRow.rowIndex)
       onClicked: {
         if (!profileRow.profile) return
-        if (profileRow.isActive) vpn.disconnectAll()
+        if (profileRow.isBrowse) root.openPicker()
+        else if (profileRow.isActive) vpn.disconnectAll()
         else vpn.connectProfile(profileRow.profile.path)
       }
     }
@@ -671,7 +902,7 @@ Panel {
       spacing: Style.space(8)
 
       Text {
-        text: profileRow.isActive ? "󰅠" : "󰦝"
+        text: profileRow.isBrowse ? "󰉋" : (profileRow.isActive ? "󰅠" : "󰦝")
         color: profileRow.isActive ? root.foreground : root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.icon
@@ -685,7 +916,9 @@ Panel {
 
         Text {
           Layout.fillWidth: true
-          text: Model.profileLabel(profileRow.profile) + (profileRow.isDefault ? "  ·  default" : "")
+          text: profileRow.isBrowse
+            ? String(profileRow.profile.name)
+            : Model.profileLabel(profileRow.profile) + (profileRow.isDefault ? "  ·  default" : "")
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
@@ -694,12 +927,110 @@ Panel {
 
         Text {
           Layout.fillWidth: true
-          text: Model.profileMeta(profileRow.profile, vpn.home)
+          text: profileRow.isBrowse
+            ? "Anywhere on disk, or a whole folder to scan"
+            : Model.profileMeta(profileRow.profile, vpn.home)
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           elide: Text.ElideRight
         }
+      }
+
+      // Connecting to a profile is a click; making it the one the switch and
+      // the bar icon dial needs its own.
+      PanelActionButton {
+        visible: !profileRow.isBrowse && !profileRow.isDefault
+        iconText: "󰐃"
+        tooltipText: "Make this the default profile"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        Layout.alignment: Qt.AlignVCenter
+        onClicked: if (profileRow.profile) vpn.chooseProfile(profileRow.profile.path)
+      }
+    }
+  }
+
+  // One row of the file picker: the way up, a folder to walk into, or a profile
+  // to take.
+  component PickerRow: CursorSurface {
+    id: pickerRow
+    property var entry: null
+    property int rowIndex: 0
+    readonly property bool isUp: pickerRow.entry && pickerRow.entry.kind === "up"
+    readonly property bool isDir: pickerRow.entry
+      && (pickerRow.entry.kind === "dir" || pickerRow.entry.kind === "up")
+    readonly property bool isCurrent: !isDir && pickerRow.entry
+      && String(pickerRow.entry.path) === vpn.configuredProfile
+
+    hasCursor: root.cursorActive && root.focusSection === "picker" && root.pickerIndex === rowIndex
+    current: isCurrent
+    foreground: root.foreground
+    implicitHeight: pickerContent.implicitHeight + Style.spacing.rowPaddingX
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onEntered: root.setPickerCursor(pickerRow.rowIndex)
+      onClicked: root.activatePickerRow(pickerRow.entry)
+    }
+
+    RowLayout {
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(10)
+      spacing: Style.space(8)
+
+      Text {
+        text: pickerRow.isUp ? "󰁝" : (pickerRow.isDir ? "󰉋" : "󰖂")
+        color: pickerRow.isDir ? root.dim : root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.icon
+        Layout.alignment: Qt.AlignVCenter
+      }
+
+      ColumnLayout {
+        id: pickerContent
+        Layout.fillWidth: true
+        spacing: Style.space(1)
+
+        Text {
+          Layout.fillWidth: true
+          text: pickerRow.isUp
+            ? Model.homeRelative(String(pickerRow.entry.path), vpn.home)
+            : String(pickerRow.entry ? pickerRow.entry.name : "")
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          elide: pickerRow.isUp ? Text.ElideLeft : Text.ElideRight
+        }
+
+        Text {
+          visible: text !== ""
+          Layout.fillWidth: true
+          text: pickerRow.isUp ? "Up one folder"
+            : (pickerRow.isCurrent ? "the default profile right now" : "")
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+      }
+
+      // A profile openvpn3 holds itself keeps working when the file moves, and
+      // shows up for every other openvpn3 tool on the machine.
+      PanelActionButton {
+        visible: !pickerRow.isDir
+        iconText: "󰋺"
+        tooltipText: "Import into openvpn3"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        enabled: !vpn.busy
+        Layout.alignment: Qt.AlignVCenter
+        onClicked: if (pickerRow.entry) vpn.importProfile(pickerRow.entry.path)
       }
     }
   }

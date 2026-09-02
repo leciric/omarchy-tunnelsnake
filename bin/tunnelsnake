@@ -3,31 +3,53 @@
 #
 # Every subcommand prints one JSON object on stdout so the QML side can
 # JSON.parse() it directly. Failures are reported inside the payload (the
-# "error" field) rather than on stderr, so a failed call still renders in the
-# panel instead of vanishing.
-#
-# Commands:
-#   status                      Sessions, link details, and transfer counters
-#   profiles [DIR ...]          .ovpn files in DIRs plus openvpn3-imported configs
-#   connect PROFILE [opts]      Start a session, wait for the tun device, wire DNS
-#   reconnect PROFILE [opts]    Drop every session first, then connect
-#   disconnect [SESSION_PATH]   Disconnect one session, or all of them
-#   dns DEVICE [opts]           Re-apply DNS to a device that is already up
-#
-# Options for connect/dns:
-#   --dns-server ADDR     DNS server to pin on the tunnel device
-#   --dns-domain DOMAIN   Routing domain, repeatable (~example.com routes only that domain)
-#   --timeout SECS        How long to wait for the tun device (default 30)
-#
-# The DNS calls go through resolvectl as your own user: systemd-resolved asks
-# polkit, Omarchy's polkit agent prompts once, and the answer is cached. Only if
-# that path fails do we retry under pkexec.
+# "error" or "message" field) rather than on stderr, so a failed call still
+# renders in the panel instead of vanishing.
 
 set -uo pipefail
 
 OVPN3=${TUNNELSNAKE_OPENVPN3:-openvpn3}
 RESOLVECTL=${TUNNELSNAKE_RESOLVECTL:-resolvectl}
 IP_BIN=${TUNNELSNAKE_IP:-ip}
+WIDGET_ID=${TUNNELSNAKE_WIDGET_ID:-linting.tunnelsnake}
+
+# What counts as a profile on disk. openvpn3 will take any file it can parse,
+# but these are the two suffixes people actually ship.
+PROFILE_SUFFIXES=("ovpn" "conf")
+
+# A directory listing is drawn one row at a time; a home folder full of build
+# output would be a wall of rows nobody scrolls through.
+BROWSE_LIMIT=${TUNNELSNAKE_BROWSE_LIMIT:-400}
+
+usage() {
+  cat <<'USAGE'
+tunnelsnake — openvpn3 bridge for the Tunnelsnake Omarchy bar widget
+
+Usage: tunnelsnake <command> [args]
+
+  status                      Sessions, link details, and transfer counters
+  profiles [DIR ...]          Profiles in DIRs plus openvpn3-imported configs
+  browse [DIR] [--hidden]     One directory: sub-folders and profile files
+  connect PROFILE [opts]      Start a session, wait for the tun device, wire DNS
+  reconnect PROFILE [opts]    Drop every session first, then connect
+  disconnect [SESSION_PATH]   Disconnect one session, or all of them
+  import FILE [--name NAME]   Import a profile into openvpn3, persistently
+  set KEY VALUE               Save a widget setting into shell.json
+  dns DEVICE [opts]           Re-apply DNS to a device that is already up
+
+Options for connect/reconnect/dns:
+  --dns-server ADDR     DNS server to pin on the tunnel device
+  --dns-domain DOMAIN   Routing domain, repeatable (~example.com routes only that domain)
+  --timeout SECS        How long to wait for the tun device (default 30)
+
+PROFILE is either a path to a .ovpn/.conf file or the D-Bus path of a
+configuration already imported into openvpn3.
+
+The DNS calls go through resolvectl as your own user: systemd-resolved asks
+polkit, Omarchy's polkit agent prompts once, and the answer is cached. Only if
+that path fails do we retry under pkexec.
+USAGE
+}
 
 # ------------------------------------------------------------------ JSON bits
 
@@ -38,7 +60,16 @@ json_str() {
   s=${s//$'\r'/}
   s=${s//$'\t'/ }
   s=${s//$'\n'/ }
+  # Anything else below 0x20 is not printable and not escapable by the rules
+  # above, so drop it rather than emit JSON no parser will take.
+  if [[ $s == *[$'\001'-$'\037']* ]]; then
+    s=$(tr -d '\001-\037' <<<"$s")
+  fi
   printf '"%s"' "$s"
+}
+
+json_or_null() {
+  [[ -n ${1-} ]] && json_str "$1" || printf 'null'
 }
 
 json_words() {
@@ -66,6 +97,14 @@ expand_home() {
 }
 
 have_openvpn3() { command -v "$OVPN3" >/dev/null 2>&1; }
+
+strip_suffix() {
+  local name=${1-} suffix
+  for suffix in "${PROFILE_SUFFIXES[@]}"; do
+    [[ ${name,,} == *.$suffix ]] && { printf '%s' "${name%.*}"; return 0; }
+  done
+  printf '%s' "$name"
+}
 
 # ------------------------------------------------------------------- sessions
 
@@ -158,7 +197,7 @@ collect_sessions() {
     items+=",\"name\":$(json_str "$name")"
     items+=",\"status\":$(json_str "$status")"
     items+=",\"state\":$(json_str "$state")"
-    items+=",\"authUrl\":$([[ -n $auth_url ]] && json_str "$auth_url" || printf 'null')}"
+    items+=",\"authUrl\":$(json_or_null "$auth_url")}"
     SESSION_PATHS+=("$path")
     count=$((count + 1))
     # The connected session wins the "active" slot; otherwise the first one
@@ -228,7 +267,7 @@ link_json() {
   domains=$("$RESOLVECTL" domain "$dev" 2>/dev/null | sed 's/^.*): *//' | tr '\n' ' ')
   printf '{"device":%s,"ipv4":%s,"dns":%s,"domains":%s}' \
     "$(json_str "$dev")" \
-    "$([[ -n $ipv4 ]] && json_str "$ipv4" || printf 'null')" \
+    "$(json_or_null "$ipv4")" \
     "$(json_words "$dns")" \
     "$(json_words "$domains")"
 }
@@ -251,56 +290,178 @@ cmd_status() {
   collect_sessions
   printf '{"installed":true,"state":%s,"activePath":%s,"authUrl":%s,"sessionCount":%d,"sessions":%s,"link":%s,"stats":%s,"error":null}\n' \
     "$(json_str "$ACTIVE_STATE")" "$(json_str "$ACTIVE_PATH")" \
-    "$([[ -n $ACTIVE_AUTH_URL ]] && json_str "$ACTIVE_AUTH_URL" || printf 'null')" "$SESSION_COUNT" \
+    "$(json_or_null "$ACTIVE_AUTH_URL")" "$SESSION_COUNT" \
     "$SESSIONS_JSON" "$(link_json "$ACTIVE_DEVICE")" "$(stats_json "$ACTIVE_PATH")"
 }
 
-# Imported profiles live in the openvpn3 config manager; loose ones are just
-# .ovpn files on disk. The widget treats both as something you can connect to.
+# `configs-list --json` is the only output shape that survives a profile name
+# with spaces in it; the column-aligned table runs the name into the owner
+# column and there is no way to tell where one ends. awk walks the object
+# because pulling in jq for three fields would make it a runtime dependency of
+# the widget rather than of its tests.
+imported_json() {
+  awk '
+    function emit() {
+      if (path != "" && name != "") printf "%s%s%s%s%s\n", path, sep, name, sep, valid
+      path = ""; name = ""; valid = "true"
+    }
+    BEGIN { sep = sprintf("%c", 31); path = ""; name = ""; valid = "true" }
+    /"\/net\/openvpn\/v3\/configuration\// {
+      if (match($0, /\/net\/openvpn\/v3\/configuration\/[^"]+/)) {
+        emit()
+        path = substr($0, RSTART, RLENGTH)
+        next
+      }
+    }
+    /"name"[ \t]*:/ {
+      if (match($0, /:[ \t]*"/)) {
+        rest = substr($0, RSTART + RLENGTH)
+        sub(/",?[ \t]*$/, "", rest)
+        gsub(/\\"/, "\"", rest)
+        gsub(/\\\\/, "\\", rest)
+        name = rest
+      }
+      next
+    }
+    /"valid"[ \t]*:/ { valid = ($0 ~ /true/) ? "true" : "false"; next }
+    END { emit() }
+  '
+}
+
+# Older openvpn3 builds have no --json. The verbose table still carries the
+# D-Bus path that session-start needs, one record per config:
+#   /net/openvpn/v3/configuration/<id>
+#   <imported>            <last used>        <use count>
+#   [!! ]<name>           <owner>
+imported_verbose() {
+  awk '
+    function emit() {
+      if (path != "" && name != "") printf "%s%s%s%s%s\n", path, sep, name, sep, valid
+      path = ""; name = ""; valid = "true"; row = 0
+    }
+    BEGIN { sep = sprintf("%c", 31); path = ""; name = ""; valid = "true"; row = 0 }
+    /^\/net\/openvpn\/v3\/configuration\// { emit(); path = $0; row = 1; next }
+    path == "" { next }
+    /^-+$/ { emit(); next }
+    { row++ }
+    row == 3 {
+      line = $0
+      if (sub(/^!![ \t]*/, "", line)) valid = "false"
+      # The owner is the last column; a name with spaces keeps everything
+      # before it.
+      sub(/[ \t]+[^ \t]+[ \t]*$/, "", line)
+      sub(/[ \t]+$/, "", line)
+      name = line
+    }
+    END { emit() }
+  '
+}
+
 imported_profiles() {
-  local raw line trimmed items="" path="" name=""
+  local items="" raw path name valid
   have_openvpn3 || { printf '%s' "$items"; return 0; }
-  raw=$("$OVPN3" configs-list 2>/dev/null)
 
-  _flush_config() {
-    [[ -z $path || -z $name ]] && { path=""; name=""; return 0; }
+  raw=$("$OVPN3" configs-list --json 2>/dev/null)
+  if [[ ${raw:0:1} == "{" ]]; then
+    raw=$(imported_json <<<"$raw")
+  else
+    raw=$("$OVPN3" configs-list -v 2>/dev/null | imported_verbose)
+  fi
+
+  while IFS=$'\x1f' read -r path name valid; do
+    [[ -n $path && -n $name ]] || continue
     [[ -n $items ]] && items+=","
-    items+="{\"kind\":\"imported\",\"id\":$(json_str "$path"),\"name\":$(json_str "$name"),\"path\":$(json_str "$path")}"
-    path=""; name=""
-  }
-
-  while IFS= read -r line; do
-    trimmed=$(trim "$line")
-    case $trimmed in
-      /net/openvpn/v3/configuration/*)
-        _flush_config
-        path=$trimmed
-        ;;
-      ---*|"") ;;
-      *)
-        # Inside a record the name is the line that is not the timestamp row.
-        [[ -n $path && $trimmed != *":"*":"* ]] && name=$trimmed
-        ;;
-    esac
+    items+="{\"kind\":\"imported\",\"id\":$(json_str "$path")"
+    items+=",\"name\":$(json_str "$(strip_suffix "${name##*/}")")"
+    items+=",\"path\":$(json_str "$path")"
+    items+=",\"source\":$(json_str "$name")"
+    items+=",\"valid\":${valid:-true}}"
   done <<<"$raw"
-  _flush_config
   printf '%s' "$items"
 }
 
 cmd_profiles() {
   local items dir file name
+  local -A seen=()
   items=$(imported_profiles)
   for dir in "$@"; do
     dir=$(expand_home "$dir")
     [[ -d $dir ]] || continue
     while IFS= read -r file; do
       [[ -n $file ]] || continue
+      # The same file reached through two configured folders (a folder and one
+      # of its parents, say) is still one profile.
+      [[ -n ${seen[$file]:-} ]] && continue
+      seen[$file]=1
       name=${file##*/}
       [[ -n $items ]] && items+=","
-      items+="{\"kind\":\"file\",\"id\":$(json_str "$file"),\"name\":$(json_str "${name%.ovpn}"),\"path\":$(json_str "$file")}"
-    done < <(find "$dir" -maxdepth 2 -type f -name '*.ovpn' 2>/dev/null | sort)
+      items+="{\"kind\":\"file\",\"id\":$(json_str "$file")"
+      items+=",\"name\":$(json_str "$(strip_suffix "$name")")"
+      items+=",\"path\":$(json_str "$file")"
+      items+=",\"source\":$(json_str "$file")"
+      items+=",\"valid\":true}"
+    done < <(find -L "$dir" -maxdepth 2 -type f \
+      \( -iname '*.ovpn' -o -iname '*.conf' \) 2>/dev/null | sort)
   done
   printf '{"profiles":[%s],"error":null}\n' "$items"
+}
+
+# One directory at a time, for the panel's file picker: sub-folders to walk
+# into and the profile files you can actually pick. Everything else is noise
+# in a list you are scrolling with the keyboard.
+cmd_browse() {
+  local dir="" hidden=0 arg
+  while (($#)); do
+    case ${1-} in
+      --hidden) hidden=1 ;;
+      --*)      ;;
+      *)        [[ -z $dir ]] && dir=$1 ;;
+    esac
+    shift
+  done
+
+  dir=$(expand_home "$dir")
+  [[ -n $dir ]] || dir=$HOME
+  # A stale starting point (a folder that has since been renamed) should open
+  # somewhere useful rather than fail.
+  [[ -d $dir ]] || dir=$HOME
+  dir=$(cd "$dir" 2>/dev/null && pwd -P) || dir=$HOME
+
+  local parent=""
+  [[ $dir != "/" ]] && parent=$(dirname "$dir")
+
+  if [[ ! -r $dir || ! -x $dir ]]; then
+    printf '{"dir":%s,"parent":%s,"home":%s,"entries":[],"truncated":false,"error":%s}\n' \
+      "$(json_str "$dir")" "$(json_or_null "$parent")" "$(json_str "$HOME")" \
+      "$(json_str "Cannot read $dir")"
+    return 0
+  fi
+
+  local items="" count=0 truncated=false entry name
+  # Directories first, then files: the same order the rows are drawn in, so
+  # the panel never has to sort.
+  local -a rows=()
+  while IFS= read -r -d '' entry; do rows+=("d$entry"); done < <(
+    find -L "$dir" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null | sort -zf)
+  while IFS= read -r -d '' entry; do rows+=("f$entry"); done < <(
+    find -L "$dir" -mindepth 1 -maxdepth 1 -type f \
+      \( -iname '*.ovpn' -o -iname '*.conf' \) -print0 2>/dev/null | sort -zf)
+
+  for entry in ${rows[@]+"${rows[@]}"}; do
+    local kind=${entry:0:1} path=${entry:1}
+    name=${path##*/}
+    ((hidden == 0)) && [[ $name == .* ]] && continue
+    if ((count >= BROWSE_LIMIT)); then truncated=true; break; fi
+    [[ -n $items ]] && items+=","
+    items+="{\"kind\":$([[ $kind == d ]] && printf '"dir"' || printf '"file"')"
+    items+=",\"name\":$(json_str "$name")"
+    items+=",\"path\":$(json_str "$path")}"
+    count=$((count + 1))
+  done
+
+  printf '{"dir":%s,"parent":%s,"home":%s,"entries":[%s],"truncated":%s,"error":null}\n' \
+    "$(json_str "$dir")" "$(json_or_null "$parent")" "$(json_str "$HOME")" \
+    "$items" "$truncated"
 }
 
 apply_dns() {
@@ -333,9 +494,9 @@ result_json() {
   local ok=$1 device=$2 message=$3 auth_url=${4-}
   printf '{"ok":%s,"device":%s,"message":%s,"authUrl":%s}\n' \
     "$ok" \
-    "$([[ -n $device ]] && json_str "$device" || printf 'null')" \
+    "$(json_or_null "$device")" \
     "$(json_str "$(trim "$message")")" \
-    "$([[ -n $auth_url ]] && json_str "$auth_url" || printf 'null')"
+    "$(json_or_null "$auth_url")"
 }
 
 # Profiles behind an SSO portal make openvpn3 print a one-time sign-in URL and
@@ -358,7 +519,7 @@ cmd_connect() {
   done
 
   have_openvpn3 || { result_json false "" "openvpn3 is not installed"; return 1; }
-  [[ -n $profile ]] || { result_json false "" "No VPN profile configured"; return 1; }
+  [[ -n $profile ]] || { result_json false "" "No VPN profile chosen — pick one in the panel"; return 1; }
 
   local out rc
   if [[ $profile == /net/openvpn/v3/configuration/* ]]; then
@@ -367,6 +528,7 @@ cmd_connect() {
   else
     profile=$(expand_home "$profile")
     [[ -f $profile ]] || { result_json false "" "Profile not found: $profile"; return 1; }
+    [[ -r $profile ]] || { result_json false "" "Profile is not readable: $profile"; return 1; }
     out=$("$OVPN3" session-start --config "$profile" --background --timeout "$timeout" 2>&1)
     rc=$?
   fi
@@ -449,6 +611,64 @@ cmd_disconnect() {
   result_json true "" ""
 }
 
+# An imported profile outlives the file it came from and can be started by
+# anyone the ACL allows, which is what you want for a profile you keep.
+cmd_import() {
+  local file=${1-} name=""
+  shift || true
+  while (($#)); do
+    case $1 in
+      --name) name=${2-}; shift 2 ;;
+      *)      shift ;;
+    esac
+  done
+
+  have_openvpn3 || { result_json false "" "openvpn3 is not installed"; return 1; }
+  file=$(expand_home "$file")
+  [[ -n $file && -f $file ]] || { result_json false "" "Profile not found: ${file:-<none>}"; return 1; }
+  [[ -n $name ]] || name=$(strip_suffix "${file##*/}")
+
+  local out rc
+  out=$("$OVPN3" config-import --config "$file" --name "$name" --persistent 2>&1)
+  rc=$?
+  if ((rc != 0)); then
+    result_json false "" "${out:-openvpn3 config-import failed}"
+    return 1
+  fi
+  # The warning openvpn3 prints for a profile missing --ca is worth passing on:
+  # the import worked, the connect will not. Otherwise say the import landed —
+  # an import that reports nothing looks like an import that did nothing.
+  local message="$name imported into openvpn3"
+  [[ ${out,,} == *warning* ]] && message=$(trim "${out#*WARNING:}")
+  result_json true "" "$message"
+}
+
+# The widget's own settings live in shell.json, which the running shell owns.
+# Going through its IPC keeps the file's shape (and the in-place reload of
+# every bar surface) the shell's business rather than ours.
+cmd_set() {
+  local key=${1-} value=${2-} shell_bin out
+  [[ -n $key ]] || { result_json false "" "No setting name given"; return 1; }
+
+  shell_bin=$(command -v omarchy-shell 2>/dev/null)
+  [[ -n $shell_bin ]] || shell_bin="${OMARCHY_PATH:-/usr/share/omarchy}/bin/omarchy-shell"
+  [[ -x $shell_bin ]] || { result_json false "" "omarchy-shell not found — set $key in ~/.config/omarchy/shell.json"; return 1; }
+
+  out=$(OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}" \
+    "$shell_bin" shell setBarWidget "$WIDGET_ID" "$key" "$(json_str "$value")" '{}' 2>&1)
+  out=$(trim "$out")
+  if [[ $out != "ok" ]]; then
+    # The shell keeps a widget's settings on its bar entry, so a widget that is
+    # not on the bar has nowhere to put them. Say that, rather than repeat the
+    # shell's own wording at someone who never asked about widgets.
+    [[ $out == "could not find widget"* ]] &&
+      out="Tunnelsnake is not on the bar, so there is nowhere to save $key. Add it with: omarchy bar put $WIDGET_ID"
+    result_json false "" "${out:-Could not save $key}"
+    return 1
+  fi
+  result_json true "" ""
+}
+
 cmd_dns() {
   local dev=${1-} dns_server=""
   local -a domains=()
@@ -469,19 +689,18 @@ cmd_dns() {
   result_json true "$dev" ""
 }
 
-usage() {
-  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
-}
-
 main() {
   local cmd=${1-status}
   shift || true
   case $cmd in
     status)     cmd_status "$@" ;;
     profiles)   cmd_profiles "$@" ;;
+    browse)     cmd_browse "$@" ;;
     connect)    cmd_connect "$@" ;;
     disconnect) cmd_disconnect "$@" ;;
     reconnect)  cmd_reconnect "$@" ;;
+    import)     cmd_import "$@" ;;
+    set)        cmd_set "$@" ;;
     dns)        cmd_dns "$@" ;;
     -h|--help|help) usage ;;
     *)          printf '{"error":%s}\n' "$(json_str "Unknown command: $cmd")"; return 2 ;;

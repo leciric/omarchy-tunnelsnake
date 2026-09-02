@@ -47,10 +47,44 @@ function parseProfiles(raw) {
       kind: String(p.kind || "file"),
       id: String(p.id || p.path),
       name: String(p.name || p.path),
-      path: String(p.path)
+      path: String(p.path),
+      // Where the profile came from: the file for a loose one, the name it was
+      // imported under for one openvpn3 holds. It is the only handle an
+      // imported profile shares with the session started from it.
+      source: String(p.source || p.path),
+      valid: p.valid !== false
     })
   }
   return out
+}
+
+// One directory as the file picker draws it: the folders you can walk into and
+// the profiles you can pick, already in row order.
+function parseBrowse(raw) {
+  var parsed = safeParse(raw)
+  if (!parsed || typeof parsed !== "object") {
+    return { ok: false, dir: "", parent: "", entries: [], truncated: false,
+             error: "Could not read that folder" }
+  }
+  var entries = Array.isArray(parsed.entries) ? parsed.entries : []
+  var out = []
+  for (var i = 0; i < entries.length; i++) {
+    var entry = entries[i]
+    if (!entry || !entry.path) continue
+    out.push({
+      kind: String(entry.kind || "file"),
+      name: String(entry.name || ""),
+      path: String(entry.path)
+    })
+  }
+  return {
+    ok: true,
+    dir: String(parsed.dir || ""),
+    parent: String(parsed.parent || ""),
+    entries: out,
+    truncated: parsed.truncated === true,
+    error: parsed.error ? String(parsed.error) : ""
+  }
 }
 
 function parseResult(raw) {
@@ -150,11 +184,14 @@ function shortPath(path) {
 
 function profileLabel(profile) {
   if (!profile) return ""
-  return String(profile.name || "").replace(/\.ovpn$/, "")
+  return String(profile.name || "").replace(/\.(ovpn|conf)$/i, "")
 }
 
 function profileMeta(profile, home) {
   if (!profile) return ""
+  // openvpn3 imports a profile it cannot use rather than refusing it, and only
+  // says so when you try to connect. Say it here instead.
+  if (profile.valid === false) return "openvpn3 rejected this profile"
   if (profile.kind === "imported") return "imported into openvpn3"
   return homeRelative(String(profile.path || ""), home)
 }
@@ -175,7 +212,7 @@ function isProfileActive(profile, sessions) {
   // An imported profile's "path" is a D-Bus object path, so its base name says
   // nothing; openvpn3 records the profile name for those sessions instead.
   var file = profile.kind === "imported"
-    ? baseName(String(profile.name || ""))
+    ? baseName(String(profile.source || profile.name || ""))
     : (baseName(path) || baseName(String(profile.name || "")))
   for (var i = 0; i < sessions.length; i++) {
     var config = String(sessions[i].config || "")
@@ -187,7 +224,7 @@ function isProfileActive(profile, sessions) {
 }
 
 function baseName(value) {
-  return String(value || "").split("/").pop().replace(/\.ovpn$/, "")
+  return String(value || "").split("/").pop().replace(/\.(ovpn|conf)$/i, "")
 }
 
 function splitWords(value) {

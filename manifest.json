@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "linting.tunnelsnake",
   "name": "Tunnelsnake",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Leandro Ciric",
   "license": "MIT",
-  "description": "OpenVPN 3 tunnel control in the Omarchy bar: connect, disconnect, and watch every running session at a glance.",
+  "description": "OpenVPN 3 tunnel control in the Omarchy bar: pick a profile from anywhere on disk, connect, disconnect, and watch every running session at a glance.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "Tunnelsnake",
-    "description": "Connect and disconnect OpenVPN 3 tunnels, and see which sessions are running.",
+    "description": "Pick a .ovpn profile from anywhere on disk, connect and disconnect OpenVPN 3 tunnels, and see which sessions are running.",
     "category": "Network",
     "allowMultiple": false,
     "defaultSection": "right",
@@ -33,14 +33,14 @@
         "type": "path",
         "label": "VPN profile",
         "defaultValue": "",
-        "description": "The .ovpn file the switch connects to. Leave empty to use the first profile found in the profiles folder."
+        "description": "The profile the switch connects to. The panel's file picker writes this for you; leave it empty to use the first profile found."
       },
       {
         "key": "profilesDir",
         "type": "path",
         "label": "Profiles folder",
         "defaultValue": "",
-        "description": "Folder scanned for .ovpn files. Imported openvpn3 configurations are always listed as well."
+        "description": "Folder scanned for .ovpn and .conf profiles. Downloads, ~/vpn, ~/openvpn and ~/.config/openvpn are always scanned too, along with anything imported into openvpn3."
       },
       {
         "key": "dnsServer",

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Stand-in for openvpn3, driven by TUNNELSNAKE_FAKE_STATE. The layouts below are
-# copied from real `openvpn3 sessions-list` output (v27), including the two
-# shapes the Config name line takes and the way Device is left blank while a
-# session is still being set up.
+# copied from real `openvpn3` v27.1 output, including the two shapes the Config
+# name line takes, the way Device is left blank while a session is still being
+# set up, and all three shapes configs-list answers in (--json, -v, and the
+# plain table that carries no D-Bus path at all).
 sep="-----------------------------------------------------------------------------"
 
 case "$1" in
@@ -72,16 +73,90 @@ OUT
     ;;
   session-stats) echo '{"BYTES_IN":1048576,"BYTES_OUT":524288,"PACKETS_IN":900,"PACKETS_OUT":700}' ;;
   configs-list)
-    cat <<OUT
+    # TUNNELSNAKE_FAKE_CONFIGS=legacy drops --json, the way an openvpn3 older
+    # than v21 does, so the verbose-table fallback gets exercised too.
+    if [[ ${2:-} == "--json" ]]; then
+      if [[ ${TUNNELSNAKE_FAKE_CONFIGS:-json} == legacy ]]; then
+        echo "openvpn3: unknown option --json" >&2
+        exit 1
+      fi
+      cat <<'OUT'
+{
+	"/net/openvpn/v3/configuration/aa11" : 
+	{
+		"acl" : 
+		{
+			"locked_down" : false,
+			"owner" : "lint",
+			"public_access" : false
+		},
+		"dco" : false,
+		"imported" : "2026-08-20 09:10:00",
+		"lastused" : "2026-08-20 09:14:02",
+		"name" : "work.ovpn",
+		"use_count" : 3,
+		"valid" : true
+	},
+	"/net/openvpn/v3/configuration/bb22" : 
+	{
+		"acl" : 
+		{
+			"locked_down" : false,
+			"owner" : "lint",
+			"public_access" : false
+		},
+		"dco" : false,
+		"imported" : "2026-08-21 10:00:00",
+		"invalid_reason" : " Configuration profile is missing required options: --ca",
+		"lastused" : "",
+		"name" : "/home/lint/vpn/site b.ovpn",
+		"use_count" : 0,
+		"valid" : false
+	}
+}
+OUT
+      exit 0
+    fi
+    if [[ ${2:-} == "-v" || ${2:-} == "--verbose" ]]; then
+      cat <<OUT
 Configuration path
-Imported                                          Last used                 Used
-Name
+Imported                        Last used                 Used
+Configuration Name                                        Owner
+Tags
 $sep
 /net/openvpn/v3/configuration/aa11
- 2026-08-20 09:10:00                               2026-08-20 09:14:02          3
- work.ovpn
+2026-08-20 09:10:00             2026-08-20 09:14:02          3
+work.ovpn                                                 lint
+Tags: (none)
+$sep
+/net/openvpn/v3/configuration/bb22
+2026-08-21 10:00:00                                          0
+!! /home/lint/vpn/site b.ovpn                             lint
+Invalid: Configuration profile is missing required options: --ca
+Tags: (none)
 $sep
 OUT
+      exit 0
+    fi
+    # The plain table carries no D-Bus path, which is exactly why neither the
+    # widget nor its tests read it.
+    cat <<OUT
+Configuration Name                                        Last used
+$sep
+work.ovpn                                                 2026-08-20 09:14:02
+!! /home/lint/vpn/site b.ovpn                             -
+$sep
+OUT
+    ;;
+  config-import)
+    if [[ ${TUNNELSNAKE_FAKE_IMPORT:-ok} == fail ]]; then
+      echo "openvpn3: could not parse configuration file" >&2
+      exit 1
+    fi
+    echo "Configuration imported.  Configuration path: /net/openvpn/v3/configuration/cc33"
+    if [[ ${TUNNELSNAKE_FAKE_IMPORT:-ok} == warn ]]; then
+      echo "WARNING:   Configuration profile is missing required options: --ca"
+    fi
     ;;
   session-start)
     # --background says nothing about web authentication; the URL is only ever
