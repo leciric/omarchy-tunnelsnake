@@ -567,7 +567,7 @@ Panel {
             Text {
               visible: !vpn.installed
               width: parent.width
-              text: "openvpn3 is not installed. Install it with: omarchy pkg add openvpn3"
+              text: "openvpn3 is not installed. It is an AUR package: yay -S openvpn3"
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall

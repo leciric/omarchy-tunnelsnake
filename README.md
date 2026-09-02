@@ -20,7 +20,7 @@ without the shell.
 ## Requirements
 
 - Omarchy with the Quickshell-based shell (`omarchy-shell`)
-- `openvpn3` (`omarchy pkg add openvpn3`)
+- `openvpn3` — it lives in the AUR, so `yay -S openvpn3`, not `omarchy pkg add`
 - `systemd-resolved` — only if you use the DNS settings
 
 ## Install
