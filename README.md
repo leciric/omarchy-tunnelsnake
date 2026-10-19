@@ -26,7 +26,7 @@ without the shell.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/<you>/omarchy-tunnelsnake.git
+omarchy plugin add https://github.com/leciric/omarchy-tunnelsnake.git
 omarchy plugin enable linting.tunnelsnake --section right
 ```
 
