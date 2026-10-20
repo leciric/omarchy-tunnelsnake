@@ -111,6 +111,9 @@ strip_suffix() {
 SESSIONS_JSON="[]"
 SESSION_COUNT=0
 SESSION_PATHS=()
+SESSION_STATES=()
+SESSION_DEVICES=()
+SESSION_AUTH_URLS=()
 AUTH_URLS=()
 ACTIVE_PATH=""
 ACTIVE_DEVICE=""
@@ -176,6 +179,9 @@ collect_sessions() {
   SESSIONS_JSON="[]"
   SESSION_COUNT=0
   SESSION_PATHS=()
+  SESSION_STATES=()
+  SESSION_DEVICES=()
+  SESSION_AUTH_URLS=()
   ACTIVE_PATH=""
   ACTIVE_DEVICE=""
   ACTIVE_STATE="disconnected"
@@ -199,6 +205,9 @@ collect_sessions() {
     items+=",\"state\":$(json_str "$state")"
     items+=",\"authUrl\":$(json_or_null "$auth_url")}"
     SESSION_PATHS+=("$path")
+    SESSION_STATES+=("$state")
+    SESSION_DEVICES+=("$device")
+    SESSION_AUTH_URLS+=("$auth_url")
     count=$((count + 1))
     # The connected session wins the "active" slot; otherwise the first one
     # keeps it, so a stalled connection still shows its device and status.
@@ -505,6 +514,10 @@ extract_auth_url() {
   grep -oE 'https?://[^[:space:]]+' <<<"${1-}" | head -1
 }
 
+extract_session_path() {
+  grep -oE '/net/openvpn/v3/sessions/[^[:space:]]+' <<<"${1-}" | head -1
+}
+
 cmd_connect() {
   local profile=${1-} timeout=30 dns_server=""
   local -a domains=()
@@ -540,18 +553,41 @@ cmd_connect() {
   local auth_url
   auth_url=$(extract_auth_url "$out")
 
+  # Follow the session this call started, never the globally "active" one: with
+  # another VPN already up, the active slot belongs to that one, and its device
+  # would get this profile's DNS. If the path is not in the output there is no
+  # safe way to know which session is ours, so stop rather than guess.
+  local session_path
+  session_path=$(extract_session_path "$out")
+  if [[ -z $session_path ]]; then
+    result_json false "" "Session started, but openvpn3 did not report its session path, so DNS was not applied. Check the session with: openvpn3 sessions-list" "$auth_url"
+    return 1
+  fi
+
   # session-start returns as soon as the session object exists; the tun device
   # shows up a moment later, and the DNS wiring needs it by name.
-  local dev="" i
+  local dev="" i idx state n
   for ((i = 0; i < timeout; i++)); do
     collect_sessions
-    if [[ $ACTIVE_STATE == needs-auth ]]; then
-      result_json true "" "Sign-in required to finish connecting" "${ACTIVE_AUTH_URL:-$auth_url}"
-      return 0
-    fi
-    dev=$ACTIVE_DEVICE
-    if [[ -n $dev ]] && "$IP_BIN" link show "$dev" >/dev/null 2>&1; then break; fi
+    idx=-1
+    for ((n = 0; n < ${#SESSION_PATHS[@]}; n++)); do
+      [[ ${SESSION_PATHS[n]} == "$session_path" ]] && { idx=$n; break; }
+    done
     dev=""
+    if ((idx >= 0)); then
+      state=${SESSION_STATES[idx]}
+      if [[ $state == needs-auth ]]; then
+        result_json true "" "Sign-in required to finish connecting" "${SESSION_AUTH_URLS[idx]:-$auth_url}"
+        return 0
+      fi
+      if [[ $state == failed || $state == disconnected ]]; then
+        result_json false "" "Session ended before it connected ($state)" "$auth_url"
+        return 1
+      fi
+      dev=${SESSION_DEVICES[idx]}
+      if [[ -n $dev ]] && "$IP_BIN" link show "$dev" >/dev/null 2>&1; then break; fi
+      dev=""
+    fi
     sleep 1
   done
 

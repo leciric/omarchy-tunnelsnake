@@ -31,6 +31,26 @@ Session name: backup.example.com
 $sep
 OUT
         ;;
+      # VPN A connected on tun0, B (the one just started) connected on tun1.
+      two)
+        cat <<OUT
+$sep
+        Path: /net/openvpn/v3/sessions/2f1c9e2ds4b1as9e12
+     Created: 2026-08-20 09:14:02                       PID: 44121
+       Owner: lint                                   Device: tun0
+ Config name: /home/lint/vpn/work.ovpn  (Config not available)
+Session name: vpn.example.com
+      Status: Connection, Client connected
+$sep
+        Path: /net/openvpn/v3/sessions/77aa11bb22cc33dd44
+     Created: 2026-08-20 09:20:41                       PID: 44987
+       Owner: lint                                   Device: tun1
+ Config name: backup.ovpn                (Config path: /net/openvpn/v3/configuration/bb22)
+Session name: backup.example.com
+      Status: Connection, Client connected
+$sep
+OUT
+        ;;
       auth)
         cat <<OUT
 $sep
@@ -162,7 +182,12 @@ OUT
     # --background says nothing about web authentication; the URL is only ever
     # available through session-auth. This mirrors that exactly.
     echo "Using configuration profile from file: ${3:-profile}"
-    echo "Session path: /net/openvpn/v3/sessions/1f75b30bsb651s42c0"
+    # TUNNELSNAKE_FAKE_START_PATH picks the path printed; set but empty prints none.
+    if [[ ${TUNNELSNAKE_FAKE_START_PATH-unset} == unset ]]; then
+      echo "Session path: /net/openvpn/v3/sessions/1f75b30bsb651s42c0"
+    elif [[ -n $TUNNELSNAKE_FAKE_START_PATH ]]; then
+      echo "Session path: $TUNNELSNAKE_FAKE_START_PATH"
+    fi
     echo "Session is running in the background"
     ;;
   session-manage) echo "Session disconnected" ;;
