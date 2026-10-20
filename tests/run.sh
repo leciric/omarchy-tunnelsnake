@@ -153,6 +153,23 @@ touch "$tmp/work.ovpn"
 out=$(TUNNELSNAKE_FAKE_STATE=auth "$snake" connect "$tmp/work.ovpn" --timeout 2)
 check "sign-in url captured"     "https://sso.example.com/saml/redirect/?RelayState=vpnauth~~abc123" "$(jq -r .authUrl <<<"$out")"
 check "does not wait for device" "Sign-in required to finish connecting" "$(jq -r .message <<<"$out")"
+
+# A is connected on tun0; starting B must wire DNS to B's tun1, not to A.
+rec="$tmp/resolvectl.log"
+printf '#!/usr/bin/env bash\necho "$*" >>"$TUNNELSNAKE_TEST_LOG"\n' >"$tmp/resolvectl"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$tmp/ip"
+chmod +x "$tmp/resolvectl" "$tmp/ip"
+out=$(TUNNELSNAKE_FAKE_STATE=two TUNNELSNAKE_FAKE_START_PATH=/net/openvpn/v3/sessions/77aa11bb22cc33dd44 \
+  TUNNELSNAKE_RESOLVECTL="$tmp/resolvectl" TUNNELSNAKE_IP="$tmp/ip" TUNNELSNAKE_TEST_LOG="$rec" \
+  "$snake" connect "$tmp/work.ovpn" --timeout 2 --dns-server 10.0.0.53 --dns-domain corp.example)
+check "second VPN reports its own device" "tun1" "$(jq -r .device <<<"$out")"
+check "dns goes to the new device"   "dns tun1 10.0.0.53"        "$(grep '^dns ' "$rec")"
+check "domains go to the new device" "domain tun1 corp.example"  "$(grep '^domain ' "$rec")"
+check "first VPN's device untouched" "0"                         "$(grep -c tun0 "$rec")"
+
+out=$(TUNNELSNAKE_FAKE_STATE=two TUNNELSNAKE_FAKE_START_PATH= "$snake" connect "$tmp/work.ovpn" --timeout 2 --dns-server 10.0.0.53)
+check "no session path: fails"    "false" "$(jq -r .ok <<<"$out")"
+check "no session path: says why" "true"  "$(jq -r '.message | contains("did not report its session path")' <<<"$out")"
 rm -rf "$tmp"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
