@@ -1,3 +1,5 @@
+<p align="center"><img src="logo.svg" width="128" alt="Tunnelsnake logo"></p>
+
 # Tunnelsnake
 
 An [Omarchy](https://omarchy.org) bar widget for OpenVPN 3. It shows whether a
