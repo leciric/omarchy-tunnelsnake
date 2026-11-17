@@ -3,7 +3,8 @@ import Quickshell
 import Quickshell.Io
 import "Model.js" as Model
 
-// All openvpn3 traffic goes through bin/tunnelsnake, which answers in JSON.
+// All openvpn3 and Firezone traffic goes through bin/tunnelsnake, which
+// answers in JSON.
 // This item owns the polling, the optimistic state, and the one-shot actions;
 // Panel.qml only reads properties and calls the functions below.
 Item {
@@ -35,6 +36,16 @@ Item {
   // Set while a connect we started is still expected to produce a URL, so the
   // browser opens by itself once — and only once, not on every poll.
   property bool _autoOpenAuth: false
+  // Firezone's half: one tunnel, owned by the Firezone app. See Model.parseFirezone.
+  property var firezone: Model.parseFirezone(null)
+  // Same optimistic trick as _desired, for the Firezone tunnel alone.
+  property int _fzDesired: -1
+  // Set when a connect found no stored sign-in and opened the Firezone window
+  // instead; `firezone status` cannot tell "signed out" from "disconnected".
+  property bool fzSignInPending: false
+  // Firezone's own last failure, drawn in its section. Kept apart from
+  // lastError, which every poll rewrites.
+  property string fzError: ""
   property string actionStatus: ""
   property string lastError: ""
   property bool refreshing: false
@@ -80,6 +91,46 @@ Item {
   }
 
   readonly property bool needsAuth: displayState === "needs-auth"
+
+  readonly property bool fzInstalled: firezone.installed
+  readonly property bool fzBusy: firezoneProcess.running || _fzDesired !== -1
+  readonly property string fzDisplayState: {
+    var state = firezone.state
+    if (_fzDesired === 1 && state !== "connected" && !fzSignInPending) return "connecting"
+    if (_fzDesired === 0 && state === "connected") return "connecting"
+    if (fzSignInPending && state !== "connected") return "signed-out"
+    return state
+  }
+  readonly property bool fzActive: fzDisplayState === "connected" || fzDisplayState === "connecting"
+
+  // The widget drives one client at a time. The setting names it; "auto",
+  // or a client that is not installed, falls back to openvpn3 when it is
+  // there and Firezone otherwise.
+  readonly property string clientSetting: String(setting("client", "auto")).trim().toLowerCase()
+  readonly property string client: {
+    if (clientSetting === "firezone" && fzInstalled) return "firezone"
+    if (clientSetting === "openvpn" && installed) return "openvpn"
+    if (installed) return "openvpn"
+    if (fzInstalled) return "firezone"
+    return "openvpn"
+  }
+  readonly property bool usingFirezone: client === "firezone"
+  readonly property bool bothInstalled: installed && fzInstalled
+
+  // What the bar icon and the hero draw: the chosen client's state, in the
+  // openvpn3 vocabulary Model.stateLabel already speaks.
+  readonly property string overallState: {
+    if (!usingFirezone) return installed ? displayState : "missing"
+    if (!fzInstalled) return "missing"
+    switch (fzDisplayState) {
+      case "connected":  return "connected"
+      case "connecting": return "connecting"
+      case "signed-out": return "needs-auth"
+      default:           return "disconnected"
+    }
+  }
+  readonly property bool switchOn: usingFirezone ? fzActive : active
+  readonly property bool switchBusy: usingFirezone ? fzBusy : busy
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 15, 5, 600)
   readonly property int connectTimeoutSec: intSetting("connectTimeoutSec", 30, 5, 120)
@@ -251,10 +302,71 @@ Item {
   }
 
   function toggleTunnel() {
+    if (usingFirezone) { firezoneActivate(); return }
     if (busy) return
     if (needsAuth) { openAuthUrl(); return }
     if (active) disconnectAll()
     else connectProfile("")
+  }
+
+  function connectClient() {
+    if (usingFirezone) firezoneConnect()
+    else connectProfile("")
+  }
+
+  function disconnectClient() {
+    if (usingFirezone) firezoneDisconnect()
+    else disconnectAll()
+  }
+
+  // Only one client at a time: switching takes the old one's tunnel down, so
+  // nothing keeps running behind a panel that no longer shows it.
+  function chooseClient(name) {
+    var next = String(name || "").toLowerCase()
+    if (next !== "openvpn" && next !== "firezone") return
+    if (next === "firezone" && !fzInstalled) return
+    if (next === "openvpn" && !installed) return
+    if (next === client) return
+    if (client === "firezone" && fzActive) firezoneDisconnect()
+    if (client === "openvpn" && (active || sessions.length > 0)) disconnectAll()
+    saveSetting("client", next, next === "firezone" ? "Using Firezone" : "Using OpenVPN")
+  }
+
+  function firezoneConnect() {
+    if (helperPath === "" || firezoneProcess.running || !fzInstalled) return
+    fzError = ""
+    actionStatus = firezone.state === "stopped" ? "Starting Firezone…" : "Connecting Firezone…"
+    fzSignInPending = false
+    _fzDesired = 1
+    firezoneProcess.command = [helperPath, "firezone-connect", "--timeout", String(connectTimeoutSec)]
+    firezoneProcess.running = true
+  }
+
+  function firezoneDisconnect() {
+    if (helperPath === "" || firezoneProcess.running || !fzInstalled) return
+    fzError = ""
+    actionStatus = "Disconnecting Firezone…"
+    fzSignInPending = false
+    _fzDesired = 0
+    firezoneProcess.command = [helperPath, "firezone-disconnect"]
+    firezoneProcess.running = true
+  }
+
+  // The sign-in itself happens in Firezone's own window (Entra ID in the
+  // browser, handed back to the app); all we can do is bring that window up.
+  function firezoneSignIn() {
+    if (helperPath === "" || firezoneProcess.running || !fzInstalled) return
+    fzError = ""
+    firezoneProcess.command = [helperPath, "firezone-signin"]
+    firezoneProcess.running = true
+  }
+
+  // One click on the Firezone row: whatever moves it forward.
+  function firezoneActivate() {
+    if (fzBusy) return
+    if (fzDisplayState === "signed-out") firezoneSignIn()
+    else if (fzActive) firezoneDisconnect()
+    else firezoneConnect()
   }
 
   // Qt.openUrlExternally goes through QDesktopServices inside the shell
@@ -302,6 +414,11 @@ Item {
     dnsDomains = parsed.domains
     bytesIn = parsed.bytesIn
     bytesOut = parsed.bytesOut
+    firezone = parsed.firezone
+    if (firezone.state === "connected") fzSignInPending = false
+    if (_fzDesired === 1 && firezone.state === "connected") _fzDesired = -1
+    if (_fzDesired === 0 && firezone.state !== "connected" && firezone.state !== "connecting") _fzDesired = -1
+    if (firezone.state === "connected") fzError = ""
     lastError = parsed.error
     // Reality caught up with the pending connect/disconnect — stop overriding.
     if (_desired === 1 && tunnelState === "connected") _desired = -1
@@ -367,6 +484,7 @@ Item {
         ticks = 0
         running = false
         root._desired = -1
+        root._fzDesired = -1
       }
     }
   }
@@ -446,6 +564,36 @@ Item {
         root.lastError = root.elide(result.message || settingStderr.text || "Could not save the setting")
       }
       root._saveMessage = ""
+    }
+  }
+
+  Process {
+    id: firezoneProcess
+    running: false
+    command: []
+    stdout: StdioCollector { id: firezoneStdout; waitForEnd: true }
+    stderr: StdioCollector { id: firezoneStderr; waitForEnd: true }
+    onExited: function(exitCode) {
+      var result = Model.parseResult(firezoneStdout.text)
+      if (exitCode === 0 && result.ok) {
+        // The helper says "Sign in…" when it opened the Firezone window instead
+        // of connecting; there is nothing to wait for until you do.
+        if (result.message.indexOf("Sign in") === 0) {
+          root.fzSignInPending = true
+          root._fzDesired = -1
+        }
+        root.actionStatus = result.message !== "" ? root.elide(result.message) : ""
+        root.fzError = ""
+      } else {
+        root._fzDesired = -1
+        root.fzError = root.elide(result.message || firezoneStderr.text || "firezone command failed")
+        root.actionStatus = ""
+      }
+      if (root.actionStatus !== "") actionStatusTimer.restart()
+      settleTimer.ticks = 0
+      settleTimer.restart()
+      root.refresh()
+      root.actionFinished(exitCode === 0 && result.ok)
     }
   }
 

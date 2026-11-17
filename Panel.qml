@@ -7,9 +7,10 @@ import qs.Commons
 import qs.Ui
 import "Model.js" as Model
 
-// The popup behind the bar icon: tunnel state and a switch up top, every
-// running openvpn3 session in the middle, every profile you can dial at the
-// bottom. BarWidget.qml owns the button and injects `bar`, `settings`, and
+// The popup behind the bar icon: tunnel state and a switch up top, then a
+// picker between openvpn3 and Firezone when both are installed. Below it, the
+// chosen client only: the Firezone tunnel, or every running openvpn3 session
+// and every profile you can dial. BarWidget.qml owns the button and injects `bar`, `settings`, and
 // `anchorItem` into this item.
 Panel {
   id: root
@@ -27,17 +28,25 @@ Panel {
     return dir.replace(/\/$/, "")
   }
 
-  // Read by the bar widget for the icon and its tooltip.
-  readonly property string displayState: vpn.displayState
-  readonly property bool tunnelUp: vpn.displayState === "connected"
-  readonly property bool tunnelBusy: vpn.displayState === "connecting"
-  readonly property int sessionCount: vpn.sessions.length
+  // Read by the bar widget for the icon and its tooltip, for whichever
+  // client the widget is driving.
+  readonly property string displayState: vpn.overallState
+  readonly property bool tunnelUp: vpn.overallState === "connected"
+  readonly property bool tunnelBusy: vpn.overallState === "connecting"
+  readonly property int sessionCount: vpn.usingFirezone ? 0 : vpn.sessions.length
+  readonly property string heroDevice: vpn.usingFirezone ? vpn.firezone.device : vpn.device
   readonly property string barTooltip: {
-    if (!vpn.installed) return "Tunnelsnake · openvpn3 not installed"
-    var label = Model.stateLabel(vpn.displayState, vpn.device)
+    if (vpn.overallState === "missing") return "Tunnelsnake · no VPN client installed"
+    var label = Model.stateLabel(vpn.overallState, heroDevice)
+    if (vpn.usingFirezone) return "Tunnelsnake · Firezone · " + label
     if (vpn.sessions.length > 1) label += " · " + vpn.sessions.length + " sessions"
     return "Tunnelsnake · " + label
   }
+
+  readonly property var clientOptions: [
+    { value: "openvpn", label: "OpenVPN", tooltip: "openvpn3 profiles" },
+    { value: "firezone", label: "Firezone", tooltip: "The Firezone client" }
+  ]
 
   property string focusSection: "header"
   property int sessionIndex: 0
@@ -67,16 +76,23 @@ Panel {
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
-  readonly property color iconColor: vpn.displayState === "connected" ? foreground : dim
-  readonly property string toggleHint: vpn.needsAuth
-    ? "Open the sign-in page"
-    : (vpn.active ? "Disconnect the tunnel" : "Connect the tunnel")
-  readonly property bool headerHasCursor: cursorActive && focusSection === "header" && vpn.installed
-  readonly property bool showSessions: vpn.sessions.length > 0
+  readonly property color iconColor: vpn.overallState === "connected" ? foreground : dim
+  readonly property string toggleHint: vpn.usingFirezone
+    ? (vpn.fzDisplayState === "signed-out" ? "Open the Firezone window to sign in"
+       : (vpn.fzActive ? "Disconnect Firezone" : "Connect Firezone"))
+    : (vpn.needsAuth ? "Open the sign-in page"
+       : (vpn.active ? "Disconnect the tunnel" : "Connect the tunnel"))
+  readonly property bool switchVisible: vpn.usingFirezone ? vpn.fzInstalled : vpn.installed
+  readonly property bool headerHasCursor: cursorActive && focusSection === "header" && switchVisible
+  readonly property bool showClientPicker: vpn.bothInstalled
+  readonly property bool showFirezone: vpn.usingFirezone && vpn.fzInstalled
+  readonly property bool showOpenvpn: !vpn.usingFirezone && vpn.installed
+  readonly property bool showSessions: showOpenvpn && vpn.sessions.length > 0
   // Always on when openvpn3 is: the last row is the way into the file picker,
   // and a fresh install with no profiles found is exactly when it is needed.
-  readonly property bool showProfiles: vpn.installed
-  readonly property bool showAuth: vpn.displayState === "needs-auth" || vpn.displayState === "failed"
+  readonly property bool showProfiles: showOpenvpn
+  readonly property bool showAuth: showOpenvpn
+    && (vpn.displayState === "needs-auth" || vpn.displayState === "failed")
 
   // The profiles you can dial, plus the row that opens the picker. Keeping the
   // picker in the same list is what makes it reachable with the keyboard
@@ -157,7 +173,9 @@ Panel {
   function sectionOrder() {
     if (picking) return ["picker"]
     var order = ["header"]
+    if (showClientPicker) order.push("client")
     if (showAuth) order.push("auth")
+    if (showFirezone) order.push("firezone")
     if (showSessions) order.push("sessions")
     if (showProfiles) order.push("profiles")
     return order
@@ -168,6 +186,10 @@ Panel {
     if (section === "profiles") return profileRows.length
     if (section === "picker") return pickerRows.length
     return 1
+  }
+
+  function clientIndex() {
+    return vpn.usingFirezone ? 1 : 0
   }
 
   function sectionCursor(section) {
@@ -199,6 +221,11 @@ Panel {
 
     // Left and right walk the folder tree, the way they do in every other file
     // list: out to the parent, in to the folder under the cursor.
+    // Left and right on the client picker move the choice itself.
+    if (!picking && focusSection === "client" && dx !== 0) {
+      vpn.chooseClient(clientOptions[dx < 0 ? 0 : 1].value)
+      return
+    }
     if (picking && dx !== 0) {
       if (dx < 0) enterFolder(vpn.browseParent)
       else {
@@ -231,9 +258,12 @@ Panel {
   function activateCursor() {
     ensureCursor()
     if (focusSection === "header") vpn.toggleTunnel()
+    else if (focusSection === "client") vpn.chooseClient(vpn.usingFirezone ? "openvpn" : "firezone")
     else if (focusSection === "auth") {
       if (vpn.needsAuth) vpn.openAuthUrl()
       else vpn.reconnect()
+    } else if (focusSection === "firezone") {
+      vpn.firezoneActivate()
     } else if (focusSection === "sessions") {
       var session = selectedSession()
       if (session) vpn.disconnectSession(session.path)
@@ -324,11 +354,17 @@ Panel {
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
     function refresh(): string { root.refresh(); return "ok" }
-    function connect(): string { vpn.connectProfile(""); return "ok" }
-    function disconnect(): string { vpn.disconnectAll(); return "ok" }
+    function connect(): string { vpn.connectClient(); return "ok" }
+    function disconnect(): string { vpn.disconnectClient(); return "ok" }
+    function client(): string { return vpn.client }
+    function use(name: string): string { vpn.chooseClient(name); return "ok" }
     function reconnect(): string { vpn.reconnect(); return "ok" }
     function signin(): string { vpn.openAuthUrl(); return vpn.authUrl !== "" ? vpn.authUrl : "no sign-in pending" }
-    function status(): string { return vpn.displayState }
+    function status(): string { return vpn.overallState }
+    function firezone(): string { return vpn.fzDisplayState }
+    function firezoneConnect(): string { vpn.firezoneConnect(); return "ok" }
+    function firezoneDisconnect(): string { vpn.firezoneDisconnect(); return "ok" }
+    function firezoneSignin(): string { vpn.firezoneSignIn(); return "ok" }
     function pick(): string { root.open(); root.openPicker(); return "ok" }
     function profile(): string { return vpn.defaultProfile() }
   }
@@ -371,9 +407,9 @@ Panel {
           return
         }
         if (key === "r") root.refresh()
-        else if (key === "c") vpn.connectProfile("")
-        else if (key === "d") vpn.disconnectAll()
-        else if (key === "f") root.openPicker()
+        else if (key === "c") vpn.connectClient()
+        else if (key === "d") vpn.disconnectClient()
+        else if (key === "f" && root.showOpenvpn) root.openPicker()
       }
 
       Flickable {
@@ -411,20 +447,20 @@ Panel {
                 id: hero
                 width: parent.width
                 title: "Tunnelsnake"
-                meta: vpn.displayState === "connected" ? root.heroPhraseText : Model.stateLabel(vpn.displayState, vpn.device)
-                detail: vpn.displayState === "connected" && vpn.device !== "" ? vpn.device : ""
+                meta: vpn.overallState === "connected" ? root.heroPhraseText : Model.stateLabel(vpn.overallState, vpn.device)
+                detail: vpn.overallState === "connected" ? root.heroDevice : ""
                 foreground: root.foreground
                 fontFamily: root.fontFamily
-                iconOpacity: vpn.displayState === "connected" ? 1.0 : 0.55
+                iconOpacity: vpn.overallState === "connected" ? 1.0 : 0.55
 
                 iconComponent: Component {
                   TunnelIcon {
                     iconSize: Style.font.display
                     color: root.iconColor
-                    filled: vpn.displayState === "connected"
+                    filled: vpn.overallState === "connected"
 
                     SequentialAnimation on pulse {
-                      running: vpn.displayState === "connecting"
+                      running: vpn.overallState === "connecting"
                       loops: Animation.Infinite
                       alwaysRunToEnd: true
                       NumberAnimation { to: 0.2; duration: 620; easing.type: Easing.InOutQuad }
@@ -436,9 +472,9 @@ Panel {
                 trailingControl: Component {
                   ToggleSwitch {
                     id: powerSwitch
-                    visible: vpn.installed
-                    checked: vpn.active
-                    busy: vpn.busy
+                    visible: root.switchVisible
+                    checked: vpn.switchOn
+                    busy: vpn.switchBusy
                     hasCursor: header.ringVisible
                     foreground: hero.foreground
                     onHovered: function(on) { if (on) header.focusHero() }
@@ -451,6 +487,25 @@ Panel {
                     }
                   }
                 }
+              }
+            }
+
+            // Which client the widget drives. Only there when both are
+            // installed; with one, there is nothing to choose.
+            ButtonGroup {
+              visible: root.showClientPicker
+              options: root.clientOptions
+              value: vpn.client
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.bodySmall
+              focusable: false
+              cursorIndex: root.cursorActive && root.focusSection === "client" ? root.clientIndex() : -1
+              onChanged: function(value) { vpn.chooseClient(value) }
+              onHovered: function(index, isHovered) {
+                if (!isHovered) return
+                root.cursorActive = true
+                root.focusSection = "client"
               }
             }
 
@@ -470,7 +525,7 @@ Panel {
             }
 
             Column {
-              visible: vpn.displayState === "connected"
+              visible: root.showOpenvpn && vpn.displayState === "connected"
               width: parent.width
               spacing: Style.spacing.labelGap
 
@@ -486,12 +541,44 @@ Panel {
             }
 
             PanelSeparator {
-              visible: vpn.installed
+              visible: root.showFirezone
               foreground: root.foreground
             }
 
             Column {
-              visible: vpn.installed
+              visible: root.showFirezone
+              width: parent.width
+              spacing: Style.space(10)
+
+              PanelSectionHeader {
+                text: "FIREZONE"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              FirezoneRow {
+                width: parent.width
+              }
+
+              Text {
+                visible: text !== ""
+                width: parent.width
+                text: vpn.fzError !== "" ? vpn.fzError
+                  : (vpn.fzDisplayState !== "connected" ? vpn.firezone.dnsWarning : "")
+                color: root.urgent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.WordWrap
+              }
+            }
+
+            PanelSeparator {
+              visible: root.showOpenvpn
+              foreground: root.foreground
+            }
+
+            Column {
+              visible: root.showOpenvpn
               width: parent.width
               spacing: Style.space(10)
 
@@ -565,9 +652,10 @@ Panel {
             }
 
             Text {
-              visible: !vpn.installed
+              // Firezone alone is a complete setup; only nag when neither is there.
+              visible: !vpn.installed && !vpn.fzInstalled
               width: parent.width
-              text: "openvpn3 is not installed. It is an AUR package: yay -S openvpn3"
+              text: "No VPN client found. openvpn3 is an AUR package (yay -S openvpn3); so is Firezone (yay -S firezone-client-gui-bin)."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -698,7 +786,7 @@ Panel {
   Timer {
     id: phraseTimer
     interval: 2800
-    running: root.opened && vpn.displayState === "connected"
+    running: root.opened && vpn.overallState === "connected"
     repeat: true
     onTriggered: phraseSwap.restart()
   }
@@ -789,6 +877,90 @@ Panel {
         enabled: !vpn.busy
         Layout.alignment: Qt.AlignVCenter
         onClicked: authRow.signIn ? vpn.openAuthUrl() : vpn.reconnect()
+      }
+    }
+  }
+
+  // The Firezone tunnel. One row, because the Firezone app runs one tunnel and
+  // decides on its own what goes through it.
+  component FirezoneRow: CursorSurface {
+    id: fzRow
+    readonly property string state: vpn.fzDisplayState
+    readonly property bool up: state === "connected"
+
+    hasCursor: root.cursorActive && root.focusSection === "firezone"
+    current: up
+    foreground: root.foreground
+    implicitHeight: fzContent.implicitHeight + Style.spacing.rowPaddingX
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: vpn.fzBusy ? Qt.ArrowCursor : Qt.PointingHandCursor
+      onEntered: {
+        root.cursorActive = true
+        root.focusSection = "firezone"
+      }
+      onClicked: vpn.firezoneActivate()
+    }
+
+    RowLayout {
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(10)
+      spacing: Style.space(8)
+
+      Rectangle {
+        implicitWidth: Style.space(7)
+        implicitHeight: Style.space(7)
+        radius: implicitWidth / 2
+        color: fzRow.up ? root.foreground
+          : (fzRow.state === "connecting" ? Color.accent
+             : (fzRow.state === "signed-out" ? root.urgent : root.dim))
+        Layout.alignment: Qt.AlignVCenter
+      }
+
+      ColumnLayout {
+        id: fzContent
+        Layout.fillWidth: true
+        spacing: Style.space(1)
+
+        Text {
+          Layout.fillWidth: true
+          text: Model.firezoneTitle(vpn.firezone)
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          elide: Text.ElideRight
+        }
+
+        Text {
+          Layout.fillWidth: true
+          text: Model.firezoneMeta({
+            state: fzRow.state,
+            device: vpn.firezone.device,
+            ipv4: vpn.firezone.ipv4,
+            actor: vpn.firezone.actor,
+            message: vpn.firezone.message
+          })
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+      }
+
+      PanelActionButton {
+        iconText: fzRow.state === "signed-out" ? "󰌾" : (vpn.fzActive ? "󰅖" : "󰐥")
+        tooltipText: fzRow.state === "signed-out" ? "Open the Firezone window to sign in"
+          : (vpn.fzActive ? "Disconnect Firezone" : "Connect Firezone")
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        enabled: !vpn.fzBusy
+        Layout.alignment: Qt.AlignVCenter
+        onClicked: vpn.firezoneActivate()
       }
     }
   }

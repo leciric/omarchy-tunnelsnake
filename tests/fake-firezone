@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Stand-in for the `firezone` CLI (firezone-cli 1.5.19), driven by
+# TUNNELSNAKE_FAKE_FZ. The status lines are copied from the real client.
+case "$1" in
+  status)
+    case "${TUNNELSNAKE_FAKE_FZ:-up}" in
+      stopped)   echo "Firezone is not running."; exit 1 ;;
+      signedout) echo "Not signed in." ;;
+      down)      echo "Not connected." ;;
+      up)        echo "Signed in to stefanini as Doe, Jane." ;;
+      *)         echo "Reconnecting to the portal" ;;
+    esac
+    ;;
+  connect)
+    case "${TUNNELSNAKE_FAKE_FZ:-up}" in
+      stopped)   echo "Firezone is not running."; exit 1 ;;
+      notoken)   printf 'No token found. To sign in:\n\n  1. Open this in a browser and sign in:\n'; exit 1 ;;
+      hang)      sleep 5 ;;
+      *)         exit 0 ;;
+    esac
+    ;;
+  disconnect)
+    [[ ${TUNNELSNAKE_FAKE_FZ:-up} == stopped ]] && { echo "Firezone is not running."; exit 1; }
+    exit 0
+    ;;
+  *) exit 2 ;;
+esac

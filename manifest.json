@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "linting.tunnelsnake",
   "name": "Tunnelsnake",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "Leandro Ciric",
   "license": "MIT",
-  "description": "OpenVPN 3 tunnel control in the Omarchy bar: pick a profile from anywhere on disk, connect, disconnect, and watch every running session at a glance.",
+  "description": "OpenVPN 3 and Firezone tunnel control in the Omarchy bar: pick a profile from anywhere on disk, connect, disconnect, and watch every running tunnel at a glance.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,11 +14,12 @@
   },
   "barWidget": {
     "displayName": "Tunnelsnake",
-    "description": "Pick a .ovpn profile from anywhere on disk, connect and disconnect OpenVPN 3 tunnels, and see which sessions are running.",
+    "description": "Connect and disconnect OpenVPN 3 profiles or the Firezone client, and see which tunnels are running.",
     "category": "Network",
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
+      "client": "auto",
       "profile": "",
       "profilesDir": "",
       "dnsServer": "",
@@ -28,6 +29,18 @@
       "hideWhenIdle": false
     },
     "schema": [
+      {
+        "key": "client",
+        "type": "enum",
+        "label": "VPN client",
+        "options": [
+          "auto",
+          "openvpn",
+          "firezone"
+        ],
+        "defaultValue": "auto",
+        "description": "The one client the widget drives. auto: openvpn3 when it is installed, otherwise Firezone. The panel has a picker for this when both are installed."
+      },
       {
         "key": "profile",
         "type": "path",

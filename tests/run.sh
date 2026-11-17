@@ -6,6 +6,9 @@ set -uo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(dirname "$here")
 export TUNNELSNAKE_OPENVPN3="$here/fake-openvpn3"
+export TUNNELSNAKE_FIREZONE="$here/fake-firezone"
+# Never launch the real Firezone app from a test.
+export TUNNELSNAKE_FIREZONE_GUI=true
 snake="$root/bin/tunnelsnake"
 
 pass=0
@@ -171,6 +174,70 @@ out=$(TUNNELSNAKE_FAKE_STATE=two TUNNELSNAKE_FAKE_START_PATH= "$snake" connect "
 check "no session path: fails"    "false" "$(jq -r .ok <<<"$out")"
 check "no session path: says why" "true"  "$(jq -r '.message | contains("did not report its session path")' <<<"$out")"
 rm -rf "$tmp"
+
+echo "firezone"
+fz=$(mktemp -d)
+# resolvectl as Omarchy ships it: only DNS-over-TLS servers, which Firezone
+# cannot read, plus Firezone's own sentinel on its tun device.
+cat >"$fz/dns-tls" <<'DNS'
+Global: 1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com
+        2606:4700:4700::1111#cloudflare-dns.com
+Link 2 (enp12s0):
+Link 19 (tun-firezone): 100.100.111.3
+DNS
+printf 'Global: 1.1.1.1#cloudflare-dns.com\nLink 2 (enp12s0): 192.168.0.1\n' >"$fz/dns-plain"
+printf 'Global:\nLink 3 (wlan0): fe80::1%%wlan0\n' >"$fz/dns-v6"
+for f in dns-tls dns-plain dns-v6; do
+  printf '#!/usr/bin/env bash\n[[ $# -eq 1 ]] && cat %q\nexit 0\n' "$fz/$f" >"$fz/resolvectl-$f"
+  chmod +x "$fz/resolvectl-$f"
+done
+printf '#!/usr/bin/env bash\necho "19: tun-firezone    inet 100.85.1.2/32 scope global tun-firezone"\n' >"$fz/ip"
+chmod +x "$fz/ip"
+
+out=$(TUNNELSNAKE_FAKE_STATE=none TUNNELSNAKE_FAKE_FZ=up TUNNELSNAKE_IP="$fz/ip" "$snake" status)
+check "is valid JSON"         "ok"               "$(jq -e . >/dev/null 2>&1 <<<"$out" && echo ok)"
+check "connected"             "connected"        "$(jq -r .firezone.state <<<"$out")"
+check "account"               "stefanini"        "$(jq -r .firezone.account <<<"$out")"
+check "actor keeps its comma" "Doe, Jane"        "$(jq -r .firezone.actor <<<"$out")"
+check "device"                "tun-firezone"     "$(jq -r .firezone.device <<<"$out")"
+check "address"               "100.85.1.2/32"    "$(jq -r .firezone.ipv4 <<<"$out")"
+check "openvpn3 untouched"    "disconnected"     "$(jq -r .state <<<"$out")"
+
+out=$(TUNNELSNAKE_FAKE_STATE=none TUNNELSNAKE_FAKE_FZ=stopped "$snake" status)
+check "app not running"       "stopped"          "$(jq -r .firezone.state <<<"$out")"
+out=$(TUNNELSNAKE_FAKE_STATE=none TUNNELSNAKE_FAKE_FZ=signedout "$snake" status)
+check "signed out"            "signed-out"       "$(jq -r .firezone.state <<<"$out")"
+out=$(TUNNELSNAKE_FAKE_STATE=none TUNNELSNAKE_FAKE_FZ=busy "$snake" status)
+check "unknown line is a transition" "connecting" "$(jq -r .firezone.state <<<"$out")"
+check "transition says what" "Reconnecting to the portal" "$(jq -r .firezone.message <<<"$out")"
+
+out=$(TUNNELSNAKE_FAKE_STATE=none TUNNELSNAKE_FAKE_FZ=down TUNNELSNAKE_RESOLVECTL="$fz/resolvectl-dns-tls" "$snake" status)
+check "DoT-only DNS warned"   "true"  "$(jq -r '.firezone.dnsWarning | contains("1.1.1.1#cloudflare-dns.com")' <<<"$out")"
+out=$(TUNNELSNAKE_FAKE_STATE=none TUNNELSNAKE_FAKE_FZ=down TUNNELSNAKE_RESOLVECTL="$fz/resolvectl-dns-plain" "$snake" status)
+check "plain link DNS is fine" "null" "$(jq -r .firezone.dnsWarning <<<"$out")"
+out=$(TUNNELSNAKE_FAKE_STATE=none TUNNELSNAKE_FAKE_FZ=down TUNNELSNAKE_RESOLVECTL="$fz/resolvectl-dns-v6" "$snake" status)
+check "scoped IPv6 DNS is fine" "null" "$(jq -r .firezone.dnsWarning <<<"$out")"
+
+# openvpn3 gone (it is being retired) must not take Firezone down with it.
+out=$(TUNNELSNAKE_OPENVPN3=/nonexistent/openvpn3 TUNNELSNAKE_FAKE_FZ=up "$snake" status)
+check "no openvpn3: still JSON" "ok"        "$(jq -e . >/dev/null 2>&1 <<<"$out" && echo ok)"
+check "no openvpn3: firezone"   "connected" "$(jq -r .firezone.state <<<"$out")"
+out=$(TUNNELSNAKE_FIREZONE=/nonexistent/firezone TUNNELSNAKE_FAKE_STATE=none "$snake" status)
+check "no firezone"             "missing"   "$(jq -r .firezone.state <<<"$out")"
+
+out=$(TUNNELSNAKE_FAKE_FZ=up "$snake" firezone-connect --timeout 3)
+check "connect ok"            "true"         "$(jq -r .ok <<<"$out")"
+check "connect device"        "tun-firezone" "$(jq -r .device <<<"$out")"
+out=$(TUNNELSNAKE_FAKE_FZ=notoken "$snake" firezone-connect --timeout 3)
+check "no token: asks to sign in" "Sign in from the Firezone window, then connect again" "$(jq -r .message <<<"$out")"
+out=$(TUNNELSNAKE_FAKE_FZ=hang TUNNELSNAKE_RESOLVECTL="$fz/resolvectl-dns-tls" "$snake" firezone-connect --timeout 1)
+check "hang times out"        "false"        "$(jq -r .ok <<<"$out")"
+check "timeout blames DNS"    "true"         "$(jq -r '.message | contains("no plain DNS server")' <<<"$out")"
+out=$(TUNNELSNAKE_FAKE_FZ=up "$snake" firezone-disconnect)
+check "disconnect ok"         "true"         "$(jq -r .ok <<<"$out")"
+out=$(TUNNELSNAKE_FAKE_FZ=stopped "$snake" firezone-disconnect)
+check "disconnect when stopped" "true"       "$(jq -r .ok <<<"$out")"
+rm -rf "$fz"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 ((fail == 0))

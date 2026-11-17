@@ -32,7 +32,50 @@ function parseStatus(raw) {
     domains: Array.isArray(link.domains) ? link.domains : [],
     bytesIn: statsValue(parsed.stats, ["BYTES_IN", "bytes_in", "bytesIn"]),
     bytesOut: statsValue(parsed.stats, ["BYTES_OUT", "bytes_out", "bytesOut"]),
-    error: parsed.error ? String(parsed.error) : ""
+    firezone: parseFirezone(parsed.firezone),
+    // With openvpn3 gone, "not installed" is the whole story only when there
+    // is no Firezone either.
+    error: parsed.error && parsed.installed === true ? String(parsed.error) : ""
+  }
+}
+
+// Firezone's half of the status: one tunnel, run by its own app, signed in
+// through that app.
+function parseFirezone(raw) {
+  var fz = raw && typeof raw === "object" ? raw : {}
+  return {
+    installed: fz.installed === true,
+    // missing | stopped | signed-out | disconnected | connecting | connected
+    state: String(fz.state || "missing"),
+    account: String(fz.account || ""),
+    actor: String(fz.actor || ""),
+    message: String(fz.message || ""),
+    device: String(fz.device || ""),
+    ipv4: String(fz.ipv4 || ""),
+    dnsWarning: String(fz.dnsWarning || "")
+  }
+}
+
+function firezoneTitle(fz) {
+  if (fz && fz.account) return "Firezone · " + fz.account
+  return "Firezone"
+}
+
+function firezoneMeta(fz) {
+  if (!fz) return ""
+  switch (String(fz.state)) {
+    case "connected": {
+      var parts = []
+      if (fz.device) parts.push(fz.device)
+      if (fz.ipv4) parts.push(String(fz.ipv4).replace(/\/32$/, ""))
+      if (fz.actor) parts.push(fz.actor)
+      return parts.length > 0 ? parts.join(" · ") : "Connected"
+    }
+    case "connecting":   return fz.message !== "" ? fz.message : "Connecting…"
+    case "signed-out":   return "Not signed in — opens the Firezone window"
+    case "stopped":      return "App not running — connecting starts it"
+    case "disconnected": return "Not connected"
+    default:             return ""
   }
 }
 
@@ -146,7 +189,7 @@ function stateLabel(state, device) {
     case "needs-auth":   return "Sign-in required"
     case "failed":       return "Connection failed"
     case "paused":       return "Paused"
-    case "missing":      return "openvpn3 not installed"
+    case "missing":      return "No VPN client installed"
     case "disconnected": return "No tunnel"
     default:             return "Unknown state"
   }
