@@ -15,9 +15,9 @@ things `vpnstart` / `vpnstop` / `vpnstatus` do in a shell, without the shell.
   disconnect, and every profile you can dial.
 - **File picker** — walk to your `.ovpn` file wherever it lives and make it
   the profile the switch connects to. No editing config files to get started.
-- **Firezone** — its own row in the panel: connect, disconnect, and sign in,
-  driving the official Firezone client. Either client works without the
-  other.
+- **Firezone** — drives the official Firezone client instead of openvpn3:
+  connect, disconnect, and sign in. The widget runs one client at a time, with
+  a picker in the panel when both are installed.
 - **DNS wiring** — optionally pins a DNS server and search domains on the tun
   device right after connecting, which is what split-DNS setups (AKS private
   link, internal zones) need.
@@ -75,7 +75,7 @@ Everything the picker writes can also be set by hand, on the widget's entry in
 |-----|--------------|
 | `profile` | The profile the switch connects to. Empty means "the first profile found". |
 | `profilesDir` | Folder scanned for profiles, on top of the ones always scanned. |
-| `defaultTunnel` | What the main switch dials: `auto` (openvpn3 when it has a profile, Firezone otherwise), `openvpn` or `firezone`. |
+| `client` | The one client the widget drives: `openvpn`, `firezone`, or `auto` (openvpn3 when installed, Firezone otherwise). The panel's picker writes this. |
 | `dnsServer` | Optional DNS server pinned on the tun device after connecting. |
 | `dnsDomains` | Optional search domains, space separated. A `~` prefix routes only that domain through the tunnel. |
 | `refreshIntervalSec` | How often openvpn3 is polled. Default 15. |
@@ -99,9 +99,9 @@ Everything the picker writes can also be set by hand, on the widget's entry in
 | Left click | Open the panel |
 | Middle click | Connect or disconnect without opening anything |
 | Right click | Force a refresh |
-| `c` / `d` / `r` in the panel | Connect, disconnect everything, refresh |
+| `c` / `d` / `r` in the panel | Connect, disconnect everything, refresh (for the chosen client) |
 | `f` in the panel | Open the file picker |
-| `z` in the panel | Connect, disconnect or sign in to Firezone |
+| ← → on the picker | Switch between OpenVPN and Firezone |
 | ↑ ↓ + Enter | Move through sessions and profiles; Enter does what clicking the row does |
 
 Clicking a session disconnects it. Clicking a profile connects it, or
@@ -110,10 +110,16 @@ default without connecting to it.
 
 ## Firezone
 
-When the `firezone` CLI is on the PATH (it ships with the GUI client), the
-panel grows a **FIREZONE** section with one row: the account, the
-`tun-firezone` address and who you are signed in as. Clicking the row, or `z`,
-does whatever moves it forward:
+The widget drives one client at a time. When both openvpn3 and the `firezone`
+CLI (it ships with the GUI client) are installed, the panel shows an
+**OpenVPN | Firezone** picker under the switch. Picking one saves it as the
+`client` setting and takes the other client's tunnel down, so only one is
+ever up. With just one of them installed there is no picker.
+
+With Firezone picked, the panel shows a single **FIREZONE** row: the account,
+the `tun-firezone` address and who you are signed in as. The switch, the row,
+`c` / `d` and a middle click on the bar icon all act on it. Clicking does
+whatever moves it forward:
 
 | Firezone says | A click |
 |---------------|---------|
@@ -128,13 +134,10 @@ connect starts the app first, and why the sign-in happens in its window:
 pointing it at your server (Settings → Advanced, Settings → General → Account
 slug) is a one-time job done there, not here.
 
-The main switch reads "on" while either client has a tunnel up, and turning it
-off takes everything down. Turning it on dials whatever `defaultTunnel` says:
-by default openvpn3 when it has a profile, Firezone otherwise. Set it to
-`firezone` once OpenVPN is on its way out:
+Picking from a script or a keybinding:
 
 ```bash
-omarchy bar set linting.tunnelsnake defaultTunnel firezone
+omarchy-shell linting.tunnelsnake use firezone   # or: use openvpn
 ```
 
 ### Two things the AUR package does not do
@@ -177,10 +180,12 @@ link.
 ## Scripting it
 
 ```bash
-omarchy-shell linting.tunnelsnake status       # connected | connecting | needs-auth | failed | disconnected, across both clients
+omarchy-shell linting.tunnelsnake status       # connected | connecting | needs-auth | failed | disconnected, for the chosen client
+omarchy-shell linting.tunnelsnake client       # openvpn | firezone
+omarchy-shell linting.tunnelsnake use firezone # switch clients, taking the other one down
 omarchy-shell linting.tunnelsnake profile      # the profile the switch would dial
-omarchy-shell linting.tunnelsnake connect      # openvpn3
-omarchy-shell linting.tunnelsnake disconnect   # openvpn3
+omarchy-shell linting.tunnelsnake connect      # the chosen client
+omarchy-shell linting.tunnelsnake disconnect
 omarchy-shell linting.tunnelsnake firezone            # connected | connecting | disconnected | signed-out | stopped | missing
 omarchy-shell linting.tunnelsnake firezoneConnect
 omarchy-shell linting.tunnelsnake firezoneDisconnect

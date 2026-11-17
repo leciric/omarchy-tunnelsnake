@@ -103,20 +103,34 @@ Item {
   }
   readonly property bool fzActive: fzDisplayState === "connected" || fzDisplayState === "connecting"
 
-  // What the bar icon and the hero draw, across both clients. A session that
-  // needs you (sign-in, failed handshake) outranks everything else, then
-  // anything up, then anything on its way up.
-  readonly property string overallState: {
-    var vpnState = installed ? displayState : "disconnected"
-    if (!installed && !fzInstalled) return "missing"
-    if (vpnState === "needs-auth" || vpnState === "failed") return vpnState
-    if (vpnState === "connected" || fzDisplayState === "connected") return "connected"
-    if (vpnState === "connecting" || fzDisplayState === "connecting") return "connecting"
-    return "disconnected"
+  // The widget drives one client at a time. The setting names it; "auto",
+  // or a client that is not installed, falls back to openvpn3 when it is
+  // there and Firezone otherwise.
+  readonly property string clientSetting: String(setting("client", "auto")).trim().toLowerCase()
+  readonly property string client: {
+    if (clientSetting === "firezone" && fzInstalled) return "firezone"
+    if (clientSetting === "openvpn" && installed) return "openvpn"
+    if (installed) return "openvpn"
+    if (fzInstalled) return "firezone"
+    return "openvpn"
   }
-  readonly property bool anyActive: (installed && active) || fzActive
-  readonly property bool anyBusy: busy || fzBusy
-  readonly property string defaultTunnel: String(setting("defaultTunnel", "auto")).trim().toLowerCase()
+  readonly property bool usingFirezone: client === "firezone"
+  readonly property bool bothInstalled: installed && fzInstalled
+
+  // What the bar icon and the hero draw: the chosen client's state, in the
+  // openvpn3 vocabulary Model.stateLabel already speaks.
+  readonly property string overallState: {
+    if (!usingFirezone) return installed ? displayState : "missing"
+    if (!fzInstalled) return "missing"
+    switch (fzDisplayState) {
+      case "connected":  return "connected"
+      case "connecting": return "connecting"
+      case "signed-out": return "needs-auth"
+      default:           return "disconnected"
+    }
+  }
+  readonly property bool switchOn: usingFirezone ? fzActive : active
+  readonly property bool switchBusy: usingFirezone ? fzBusy : busy
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 15, 5, 600)
   readonly property int connectTimeoutSec: intSetting("connectTimeoutSec", 30, 5, 120)
@@ -287,29 +301,35 @@ Item {
     actionProcess.running = true
   }
 
-  // What the main switch dials: the setting when it names a client that is
-  // there, otherwise openvpn3 when it has a profile, otherwise Firezone.
-  function switchTarget() {
-    if (defaultTunnel === "firezone" && fzInstalled) return "firezone"
-    if (defaultTunnel === "openvpn" && installed) return "openvpn"
-    if (installed && activeProfile !== "") return "openvpn"
-    if (fzInstalled) return "firezone"
-    return "openvpn"
-  }
-
-  // The switch reads "on" while anything is up, so turning it off takes down
-  // everything, whichever client it belongs to.
   function toggleTunnel() {
-    if (anyBusy) return
+    if (usingFirezone) { firezoneActivate(); return }
+    if (busy) return
     if (needsAuth) { openAuthUrl(); return }
-    if (anyActive) { disconnectEverything(); return }
-    if (switchTarget() === "firezone") firezoneConnect()
+    if (active) disconnectAll()
     else connectProfile("")
   }
 
-  function disconnectEverything() {
-    if (installed && (active || sessions.length > 0)) disconnectAll()
-    if (fzActive) firezoneDisconnect()
+  function connectClient() {
+    if (usingFirezone) firezoneConnect()
+    else connectProfile("")
+  }
+
+  function disconnectClient() {
+    if (usingFirezone) firezoneDisconnect()
+    else disconnectAll()
+  }
+
+  // Only one client at a time: switching takes the old one's tunnel down, so
+  // nothing keeps running behind a panel that no longer shows it.
+  function chooseClient(name) {
+    var next = String(name || "").toLowerCase()
+    if (next !== "openvpn" && next !== "firezone") return
+    if (next === "firezone" && !fzInstalled) return
+    if (next === "openvpn" && !installed) return
+    if (next === client) return
+    if (client === "firezone" && fzActive) firezoneDisconnect()
+    if (client === "openvpn" && (active || sessions.length > 0)) disconnectAll()
+    saveSetting("client", next, next === "firezone" ? "Using Firezone" : "Using OpenVPN")
   }
 
   function firezoneConnect() {

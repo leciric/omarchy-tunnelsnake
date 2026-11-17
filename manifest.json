@@ -14,21 +14,33 @@
   },
   "barWidget": {
     "displayName": "Tunnelsnake",
-    "description": "Connect and disconnect OpenVPN 3 profiles and the Firezone client, and see which tunnels are running.",
+    "description": "Connect and disconnect OpenVPN 3 profiles or the Firezone client, and see which tunnels are running.",
     "category": "Network",
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
+      "client": "auto",
       "profile": "",
       "profilesDir": "",
       "dnsServer": "",
       "dnsDomains": "",
       "refreshIntervalSec": 15,
       "connectTimeoutSec": 30,
-      "hideWhenIdle": false,
-      "defaultTunnel": "auto"
+      "hideWhenIdle": false
     },
     "schema": [
+      {
+        "key": "client",
+        "type": "enum",
+        "label": "VPN client",
+        "options": [
+          "auto",
+          "openvpn",
+          "firezone"
+        ],
+        "defaultValue": "auto",
+        "description": "The one client the widget drives. auto: openvpn3 when it is installed, otherwise Firezone. The panel has a picker for this when both are installed."
+      },
       {
         "key": "profile",
         "type": "path",
@@ -42,18 +54,6 @@
         "label": "Profiles folder",
         "defaultValue": "",
         "description": "Folder scanned for .ovpn and .conf profiles. Downloads, ~/vpn, ~/openvpn and ~/.config/openvpn are always scanned too, along with anything imported into openvpn3."
-      },
-      {
-        "key": "defaultTunnel",
-        "type": "enum",
-        "label": "Main switch connects",
-        "options": [
-          "auto",
-          "openvpn",
-          "firezone"
-        ],
-        "defaultValue": "auto",
-        "description": "What the panel switch and a middle click dial. auto: openvpn3 when it has a profile, otherwise Firezone. Turning the switch off always takes every tunnel down."
       },
       {
         "key": "dnsServer",
