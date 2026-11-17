@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "linting.tunnelsnake",
   "name": "Tunnelsnake",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "Leandro Ciric",
   "license": "MIT",
-  "description": "OpenVPN 3 tunnel control in the Omarchy bar: pick a profile from anywhere on disk, connect, disconnect, and watch every running session at a glance.",
+  "description": "OpenVPN 3 and Firezone tunnel control in the Omarchy bar: pick a profile from anywhere on disk, connect, disconnect, and watch every running tunnel at a glance.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "Tunnelsnake",
-    "description": "Pick a .ovpn profile from anywhere on disk, connect and disconnect OpenVPN 3 tunnels, and see which sessions are running.",
+    "description": "Connect and disconnect OpenVPN 3 profiles and the Firezone client, and see which tunnels are running.",
     "category": "Network",
     "allowMultiple": false,
     "defaultSection": "right",
@@ -25,7 +25,8 @@
       "dnsDomains": "",
       "refreshIntervalSec": 15,
       "connectTimeoutSec": 30,
-      "hideWhenIdle": false
+      "hideWhenIdle": false,
+      "defaultTunnel": "auto"
     },
     "schema": [
       {
@@ -41,6 +42,18 @@
         "label": "Profiles folder",
         "defaultValue": "",
         "description": "Folder scanned for .ovpn and .conf profiles. Downloads, ~/vpn, ~/openvpn and ~/.config/openvpn are always scanned too, along with anything imported into openvpn3."
+      },
+      {
+        "key": "defaultTunnel",
+        "type": "enum",
+        "label": "Main switch connects",
+        "options": [
+          "auto",
+          "openvpn",
+          "firezone"
+        ],
+        "defaultValue": "auto",
+        "description": "What the panel switch and a middle click dial. auto: openvpn3 when it has a profile, otherwise Firezone. Turning the switch off always takes every tunnel down."
       },
       {
         "key": "dnsServer",

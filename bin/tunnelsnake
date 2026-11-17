@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# tunnelsnake — openvpn3 bridge for the Tunnelsnake Omarchy bar widget.
+# tunnelsnake — openvpn3 and Firezone bridge for the Tunnelsnake Omarchy bar
+# widget.
 #
 # Every subcommand prints one JSON object on stdout so the QML side can
 # JSON.parse() it directly. Failures are reported inside the payload (the
@@ -12,6 +13,9 @@ OVPN3=${TUNNELSNAKE_OPENVPN3:-openvpn3}
 RESOLVECTL=${TUNNELSNAKE_RESOLVECTL:-resolvectl}
 IP_BIN=${TUNNELSNAKE_IP:-ip}
 WIDGET_ID=${TUNNELSNAKE_WIDGET_ID:-linting.tunnelsnake}
+FIREZONE=${TUNNELSNAKE_FIREZONE:-firezone}
+FIREZONE_GUI=${TUNNELSNAKE_FIREZONE_GUI:-firezone-client-gui}
+FIREZONE_DEVICE=${TUNNELSNAKE_FIREZONE_DEVICE:-tun-firezone}
 
 # What counts as a profile on disk. openvpn3 will take any file it can parse,
 # but these are the two suffixes people actually ship.
@@ -23,11 +27,11 @@ BROWSE_LIMIT=${TUNNELSNAKE_BROWSE_LIMIT:-400}
 
 usage() {
   cat <<'USAGE'
-tunnelsnake — openvpn3 bridge for the Tunnelsnake Omarchy bar widget
+tunnelsnake — openvpn3 and Firezone bridge for the Tunnelsnake Omarchy bar widget
 
 Usage: tunnelsnake <command> [args]
 
-  status                      Sessions, link details, and transfer counters
+  status                      Sessions, link details, transfer counters, Firezone
   profiles [DIR ...]          Profiles in DIRs plus openvpn3-imported configs
   browse [DIR] [--hidden]     One directory: sub-folders and profile files
   connect PROFILE [opts]      Start a session, wait for the tun device, wire DNS
@@ -36,6 +40,10 @@ Usage: tunnelsnake <command> [args]
   import FILE [--name NAME]   Import a profile into openvpn3, persistently
   set KEY VALUE               Save a widget setting into shell.json
   dns DEVICE [opts]           Re-apply DNS to a device that is already up
+  firezone-connect [--timeout SECS]
+                              Start the Firezone app if needed, then bring it up
+  firezone-disconnect         Take Firezone down, keeping the sign-in
+  firezone-signin             Open the Firezone window to sign in
 
 Options for connect/reconnect/dns:
   --dns-server ADDR     DNS server to pin on the tunnel device
@@ -292,15 +300,18 @@ stats_json() {
 # ------------------------------------------------------------------- commands
 
 cmd_status() {
+  local firezone
+  firezone=$(firezone_json)
   if ! have_openvpn3; then
-    printf '{"installed":false,"state":"missing","activePath":"","authUrl":null,"sessionCount":0,"sessions":[],"link":null,"stats":null,"error":"openvpn3 is not installed"}\n'
+    printf '{"installed":false,"state":"missing","activePath":"","authUrl":null,"sessionCount":0,"sessions":[],"link":null,"stats":null,"firezone":%s,"error":"openvpn3 is not installed"}\n' "$firezone"
     return 0
   fi
   collect_sessions
-  printf '{"installed":true,"state":%s,"activePath":%s,"authUrl":%s,"sessionCount":%d,"sessions":%s,"link":%s,"stats":%s,"error":null}\n' \
+  printf '{"installed":true,"state":%s,"activePath":%s,"authUrl":%s,"sessionCount":%d,"sessions":%s,"link":%s,"stats":%s,"firezone":%s,"error":null}\n' \
     "$(json_str "$ACTIVE_STATE")" "$(json_str "$ACTIVE_PATH")" \
     "$(json_or_null "$ACTIVE_AUTH_URL")" "$SESSION_COUNT" \
-    "$SESSIONS_JSON" "$(link_json "$ACTIVE_DEVICE")" "$(stats_json "$ACTIVE_PATH")"
+    "$SESSIONS_JSON" "$(link_json "$ACTIVE_DEVICE")" "$(stats_json "$ACTIVE_PATH")" \
+    "$firezone"
 }
 
 # `configs-list --json` is the only output shape that survives a profile name
@@ -725,6 +736,195 @@ cmd_dns() {
   result_json true "$dev" ""
 }
 
+# ------------------------------------------------------------------- firezone
+
+# Firezone's tunnel runs as a root service, but it only takes orders from the
+# GUI client, and the `firezone` CLI talks to the GUI. So the GUI has to be
+# running for any of this to work, and it is the GUI that holds the sign-in.
+
+have_firezone() { command -v "$FIREZONE" >/dev/null 2>&1; }
+
+FZ_STATE="missing"
+FZ_ACCOUNT=""
+FZ_ACTOR=""
+FZ_MESSAGE=""
+
+# `firezone status` speaks English, one line:
+#   Firezone is not running.            (exit 1: the GUI is not up)
+#   Not signed in.
+#   Not connected.
+#   Signed in to <account> as <name>.   (the tunnel is up)
+# Anything else is a transition, and is reported as connecting.
+firezone_state_from() {
+  local out=${1-} rc=${2-0} line
+  line=$(trim "$(head -1 <<<"$out")")
+  FZ_ACCOUNT=""
+  FZ_ACTOR=""
+  FZ_MESSAGE=""
+  case $line in
+    *"not running"*)  FZ_STATE="stopped" ;;
+    "Not signed in"*) FZ_STATE="signed-out" ;;
+    "Not connected"*) FZ_STATE="disconnected" ;;
+    "Signed in to "*)
+      FZ_STATE="connected"
+      line=${line#Signed in to }
+      line=${line%.}
+      FZ_ACCOUNT=${line%% as *}
+      [[ $line == *" as "* ]] && FZ_ACTOR=${line#* as }
+      ;;
+    "Signed in as "*)
+      FZ_STATE="connected"
+      line=${line#Signed in as }
+      FZ_ACTOR=${line%.}
+      ;;
+    "")
+      FZ_STATE=$( ((rc == 0)) && printf 'disconnected' || printf 'stopped')
+      ;;
+    *)
+      FZ_STATE="connecting"
+      FZ_MESSAGE=$line
+      ;;
+  esac
+}
+
+firezone_probe() {
+  if ! have_firezone; then
+    FZ_STATE="missing"; FZ_ACCOUNT=""; FZ_ACTOR=""; FZ_MESSAGE=""
+    return 0
+  fi
+  local out rc
+  out=$(timeout 5 "$FIREZONE" status 2>&1)
+  rc=$?
+  firezone_state_from "$out" "$rc"
+}
+
+# Firezone learns the upstream resolvers from `resolvectl dns` and needs each
+# entry to be a plain address. Omarchy ships systemd-resolved with only global
+# DNS-over-TLS servers, written `1.1.1.1#cloudflare-dns.com`; Firezone cannot
+# read those, decides there is no DNS at all, cannot resolve its own portal,
+# and gives up with "no IP addresses available". Spot that before it bites.
+# Firezone's own sentinel on its tun device does not count.
+firezone_dns_ok() {
+  local out
+  out=$("$RESOLVECTL" dns 2>/dev/null) || return 0
+  [[ -n $out ]] || return 0
+  awk -v skip="$FIREZONE_DEVICE" '
+    /^(Global|Link)/ {
+      link = $0
+      sub(/:.*/, "", link)
+      own = (index(link, "(" skip ")") > 0)
+      sub(/^[^:]*:/, "")
+    }
+    {
+      if (own) next
+      for (i = 1; i <= NF; i++) {
+        w = $i
+        if (w ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(%[^#]*)?$/) found = 1
+        else if (w ~ /^[0-9A-Fa-f]*:[0-9A-Fa-f:]*:[0-9A-Fa-f]*(%[^#]*)?$/) found = 1
+      }
+    }
+    END { exit found ? 0 : 1 }
+  ' <<<"$out"
+}
+
+firezone_json() {
+  firezone_probe
+  if [[ $FZ_STATE == missing ]]; then
+    printf '{"installed":false,"state":"missing","account":null,"actor":null,"message":null,"device":null,"ipv4":null,"dnsWarning":null}'
+    return 0
+  fi
+  local dev="" ipv4="" warning=""
+  if [[ $FZ_STATE == connected ]]; then
+    dev=$FIREZONE_DEVICE
+    ipv4=$("$IP_BIN" -4 -o addr show "$dev" 2>/dev/null | awk '{print $4; exit}')
+  elif ! firezone_dns_ok; then
+    warning="systemd-resolved has no DNS server Firezone can read: DNS-over-TLS entries like 1.1.1.1#cloudflare-dns.com do not count. Give your network link a plain DNS server, or Firezone cannot reach its portal."
+  fi
+  printf '{"installed":true,"state":%s,"account":%s,"actor":%s,"message":%s,"device":%s,"ipv4":%s,"dnsWarning":%s}' \
+    "$(json_str "$FZ_STATE")" "$(json_or_null "$FZ_ACCOUNT")" "$(json_or_null "$FZ_ACTOR")" \
+    "$(json_or_null "$FZ_MESSAGE")" "$(json_or_null "$dev")" "$(json_or_null "$ipv4")" \
+    "$(json_or_null "$warning")"
+}
+
+firezone_gui_running() {
+  local out
+  out=$(timeout 5 "$FIREZONE" status 2>&1) || [[ $out != *"not running"* ]]
+}
+
+# The GUI is a tray app that stays put once launched; detach it so it outlives
+# this helper and the shell process that ran it.
+firezone_launch_gui() {
+  command -v "$FIREZONE_GUI" >/dev/null 2>&1 || return 1
+  setsid -f "$FIREZONE_GUI" >/dev/null 2>&1 </dev/null
+}
+
+firezone_start_gui() {
+  firezone_gui_running && return 0
+  firezone_launch_gui || return 1
+  local i
+  for ((i = 0; i < 20; i++)); do
+    firezone_gui_running && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+cmd_firezone_connect() {
+  local timeout=30
+  while (($#)); do
+    case $1 in
+      --timeout) timeout=${2-30}; shift 2 ;;
+      *)         shift ;;
+    esac
+  done
+  have_firezone || { result_json false "" "Firezone is not installed"; return 1; }
+  firezone_start_gui || { result_json false "" "Could not start the Firezone app ($FIREZONE_GUI)"; return 1; }
+
+  local out rc
+  out=$(timeout "$timeout" "$FIREZONE" connect </dev/null 2>&1)
+  rc=$?
+  # No token yet: the sign-in happens in the GUI (Entra ID in the browser,
+  # handed back to the app through its deep link), which stores the token
+  # where the CLI finds it next time.
+  if [[ $out == *"No token found"* || $out == *"Not signed in"* ]]; then
+    firezone_launch_gui
+    result_json true "" "Sign in from the Firezone window, then connect again"
+    return 0
+  fi
+  if ((rc == 124)); then
+    local hint="Firezone did not come up in ${timeout}s"
+    firezone_dns_ok || hint+=" — systemd-resolved has no plain DNS server it can use"
+    result_json false "" "$hint"
+    return 1
+  fi
+  if ((rc != 0)); then
+    result_json false "" "${out:-firezone connect failed}"
+    return 1
+  fi
+  result_json true "$FIREZONE_DEVICE" ""
+}
+
+cmd_firezone_disconnect() {
+  have_firezone || { result_json false "" "Firezone is not installed"; return 1; }
+  local out
+  out=$(timeout 15 "$FIREZONE" disconnect 2>&1)
+  local rc=$?
+  # Nothing running means nothing to take down.
+  if ((rc != 0)) && [[ $out != *"not running"* ]]; then
+    result_json false "" "${out:-firezone disconnect failed}"
+    return 1
+  fi
+  result_json true "" ""
+}
+
+# A second launch of the GUI brings its window forward, which is where the
+# Sign in button lives; the first launch opens it anyway.
+cmd_firezone_signin() {
+  have_firezone || { result_json false "" "Firezone is not installed"; return 1; }
+  firezone_launch_gui || { result_json false "" "Could not start the Firezone app ($FIREZONE_GUI)"; return 1; }
+  result_json true "" "Sign in from the Firezone window"
+}
+
 main() {
   local cmd=${1-status}
   shift || true
@@ -738,6 +938,9 @@ main() {
     import)     cmd_import "$@" ;;
     set)        cmd_set "$@" ;;
     dns)        cmd_dns "$@" ;;
+    firezone-connect)    cmd_firezone_connect "$@" ;;
+    firezone-disconnect) cmd_firezone_disconnect "$@" ;;
+    firezone-signin)     cmd_firezone_signin "$@" ;;
     -h|--help|help) usage ;;
     *)          printf '{"error":%s}\n' "$(json_str "Unknown command: $cmd")"; return 2 ;;
   esac
